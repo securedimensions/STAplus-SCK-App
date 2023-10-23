@@ -90,12 +90,26 @@ def registerApp() -> Tuple[str, str]:
         "application_type": "web"
     }
 
-    header = {'Content-Type': 'application/json', 'Accept': 'application/json'}
-    response = requests.post('https://www.authenix.eu/oauth/register', data=json.dumps(request), headers=header)
-    if response.status_code != 200:
-        _logger.error("App Registration error: ", response.content)
+    register = False
+    app_metadata = {}
+    try:
+        with open('SensorApp.json', 'r') as f:
+            app_metadata = json.loads(f.read())
+            if int(time.time()) >= app_metadata['expires']:
+                register = True
+    except FileNotFoundError:
+                register = True
 
-    app_metadata = response.json()
+    if register:
+        header = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+        response = requests.post('https://www.authenix.eu/oauth/register', data=json.dumps(request), headers=header)
+        if response.status_code != 200:
+            _logger.error("App Registration error: ", response.content)
+
+        app_metadata = response.json()
+        with open('SensorApp.json', 'w') as f:
+            json.dump(app_metadata, f)
+
     client_id = app_metadata['client_id']
     client_secret = app_metadata['client_secret']
 
