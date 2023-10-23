@@ -57,6 +57,7 @@ client_id = f'python-mqtt-{random.randint(0, 1000)}'
 kit_id = '16526'
 location = staPlus.Location(name="Munich", description="A nice place on Earth", location=Point((11.509234,48.1107284)), encoding_type='application/geo+json')
 
+sck = Serial('/dev/ttyACM0', 115200, timeout=10)
 
 def generate_sha256_pkce(length: int) -> Tuple[str, str]:
     if not (43 <= length <= 128):
@@ -228,11 +229,6 @@ def publish(service, client, ids):
     pm10.feature_of_interest = foi
     pm10.datastream = service.datastreams().find(ids.get('pm10_id'))
 
-    if LOCAL:
-        sck = Serial('/dev/tty.usbmodem14201', 115200, timeout=10)
-    else:
-        #sck = Serial('/dev/ttyACM0', 115200, timeout=10)
-        sck = Serial('/dev/tty.usbmodem14201', 115200, timeout=10)
     sck.write('shell -on\nmonitor -noms Temperature,Humidity,Light,Noise dBA,Barometric pressure,PM 1.0,PM 2.5,PM 10.0\n'.encode('ASCII'))
     while True:
         data = None
