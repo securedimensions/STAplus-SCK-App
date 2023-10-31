@@ -8,7 +8,7 @@ In addition, the Smart Citizen Kit v2.1 as made available from Fablab Barcelona 
 
 ### Connect the Hardware
 Connect the Smart Citizen Kit v2.1 with a decent USB cable to your computer.
-Then find the `tty` that makes the serial communication to the Smart Citizen Kit available:
+Then find the `tty` (using `ls /dev/tty*`) that makes the serial communication to the Smart Citizen Kit available:
 
 * Raspberry PI: The Smart Citizen Kit typically connects as `/dev/ttyACM0`
 * MAC OS: The Smart Citizen Kit connects as `/dev/tty.usbmodem<number>` where the `number` is subject to change
@@ -21,19 +21,23 @@ First, `cd` into your favorite directory and then clone this repository with `gi
 
 Before continuing, please setup a Python virtual environment using `python3 -m venv .` and activate the virtual environment with `source bin/activate`.
 
-### Install Rust
-To make sure that the Python `cryptography` module installs, it is important to install a Rust compiler >= v1.56.0 first. 
-Please follow the howto from the [Rust homepage](https://rustup.rs)
-
 ### Install Python dependencies
 To install the dependencies, simply execute `pip install -r requirements.txt`
+
+### Install Rust (optional)
+After finishing the installation of all dependencies, please make sure that the Python `cryptography` module installed. 
+
+If the `cryptography` module did not install in the previous step, it needs to be compiled from source. To allow `pip` to compile the module, it is important to install a Rust compiler >= v1.56.0 first. 
+
+Please follow the howto from the [Rust homepage](https://rustup.rs) and then repeat the installation of dependencies using `pip install -r requirements.txt`.
 
 ### Configure the Application
 The configuration must be done in the source code ;)
 
-The file `SensorApp.py` contains the line 57 the number for your SCK kit that you received from the registration with `https://start.smartcitizen.me`. Please update the variable `kit_id` with your number
+The file `SensorApp.py` contains the line 57 the number for your SCK kit that you received from the registration with `https://start.smartcitizen.me`. Please update the variable `kit_id` with your number if you are using a new SCK that has not been registered before!
 
 The file `SensorApp.py` contains the line 58 the variable `location` that is used to set the location of the `Thing` and `FeatureOfInterest`. Please update as you see fit!
+
 ```python
 location = staPlus.Location(name="Munich", description="A nice place on Earth", location=Point((11.509234,48.1107284)), encoding_type='application/geo+json')
 ```
