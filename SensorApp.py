@@ -55,9 +55,10 @@ port = 1883
 topic = "v1.1/Observations"
 client_id = f'python-mqtt-{random.randint(0, 1000)}'
 kit_id = '16526'
-location = staPlus.Location(name="Munich", description="A nice place on Earth", location=Point((11.509234,48.1107284)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Munich", description="A nice place on Earth", location=Point((11.509234,48.1107284)), encoding_type='application/geo+json')
+location = staPlus.Location(name="London", description="Geovation Hub", location=Point((-0.0996240,51.5244167)), encoding_type='application/geo+json')
 
-sck = Serial('/dev/ttyACM0', 115200, timeout=10)
+sck = Serial('/dev/tty.usbmodem14301', 115200, timeout=10)
 
 def generate_sha256_pkce(length: int) -> Tuple[str, str]:
     if not (43 <= length <= 128):
@@ -179,8 +180,8 @@ def connect_mqtt(token):
 
 
 def publish(service, client, ids):
-    thing = service.things().query().filter("id eq '" + ids.get('thing_id') + "'").expand("Locations").list().get(0)
-    location = thing.locations.get(0)
+    thing = service.things().query().filter("id eq '" + ids.get('thing_id') + "'") #.expand("Locations").list().get(0)
+    thing.locations = [location]
     lon = location.location['coordinates'][0]
     lat = location.location['coordinates'][1]
 
@@ -192,9 +193,9 @@ def publish(service, client, ids):
                 foi = f
                 break
     if foi is None:
-        foi = frost_sta_client.model.feature_of_interest.FeatureOfInterest(location.name, location.description, 'application/geo+json', Point((lon, lat)))
-        foi_id = service.create(foi)
-        foi = service.features_of_interest().find(foi_id)
+        p = Point((lon, lat))
+        foi = frost_sta_client.model.feature_of_interest.FeatureOfInterest(location.name, location.description, 'application/geo+json', p)
+        service.create(foi)
 
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     temperature = staPlus.Observation(None, None, now)
