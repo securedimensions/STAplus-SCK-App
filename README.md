@@ -42,6 +42,12 @@ The file `SensorApp.py` contains the line 58 the variable `location` that is use
 location = staPlus.Location(name="Munich", description="A nice place on Earth", location=Point((11.509234,48.1107284)), encoding_type='application/geo+json')
 ```
 
+The file `SensorApp.py` contains in `line 61` the variable representing the serial port. Please update as you see fit (considering what is explained in the "Connect the Hardware" of this README)!
+
+```python
+sck = Serial('/dev/tty.usbmodem14301', 115200, timeout=10) 
+```
+
 ### Run the Application
 The application can be started from the terminal window using:
 
