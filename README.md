@@ -105,4 +105,4 @@ If started in the background, you need to obtain the `process_id` via `ps -ef|gr
 Please to try resolve the issue reported in the terminal window and run the application again. If nothing helps, please create an issue.
 
 ### Appreciation
-Work on this project has being funded by the European Commission under Horizon Europe project [CitiObs](https://www.citiobs.eu).
+Work on this project has being funded by the European Union under Horizon Europe project [CitiObs](https://www.citiobs.eu).
