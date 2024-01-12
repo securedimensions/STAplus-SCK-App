@@ -25,7 +25,6 @@ from frost_sta_client.utils import transform_entity_to_json_dict
 from geojson import Point
 from secd_staplus_client.service import auth_handler
 from secd_staplus_client import utils
-from hookdns import hosts
 from paho.mqtt import client as mqtt_client
 from datetime import datetime, timezone
 from serial import Serial
@@ -44,10 +43,13 @@ from oauth2_client.credentials_manager import CredentialManager
 
 import secd_staplus_client as staPlus
 
+FIRST_RECONNECT_DELAY = 1
+RECONNECT_RATE = 2
+MAX_RECONNECT_COUNT = 12
+MAX_RECONNECT_DELAY = 60
+
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 _logger = logging.getLogger()
-
-LOCAL = False
 
 url = "https://citiobs.demo.secure-dimensions.de/staplus/v1.1"
 broker = 'citiobs.demo.secure-dimensions.de'
@@ -55,10 +57,12 @@ port = 1883
 topic = "v1.1/Observations"
 client_id = f'python-mqtt-{random.randint(0, 1000)}'
 kit_id = '16526'
-#location = staPlus.Location(name="Munich", description="A nice place on Earth", location=Point((11.509234,48.1107284)), encoding_type='application/geo+json')
-location = staPlus.Location(name="London", description="Geovation Hub", location=Point((-0.0996240,51.5244167)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Spitzingsee", description="A nice place on Earth", location=Point((11.885329792,47.659664028)), encoding_type='application/geo+json')
+location = staPlus.Location(name="Munich", description="A nice place on Earth", location=Point((11.509234,48.1107284)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="London", description="Geovation Hub", location=Point((-0.0996240,51.5244167)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Cape Town", description="A diverse place on Earth", location=Point((18.423300,-33.918861)), encoding_type='application/geo+json')
 
-sck = Serial('/dev/tty.usbmodem14301', 115200, timeout=10)
+sck = Serial('/dev/tty.usbmodem401201', 115200, timeout=10)
 
 def generate_sha256_pkce(length: int) -> Tuple[str, str]:
     if not (43 <= length <= 128):
@@ -119,8 +123,26 @@ def registerApp() -> Tuple[str, str]:
     _logger.info("client_secret :%s", client_secret)
     return client_id, client_secret
 
+def updateTokens(refresh_token):
+    scopes = ['openid', 'profile', 'citiobs.secd.eu#create', 'citiobs.secd.eu#update', 'offline_access']
+    redirect_uri = 'http://127.0.0.1:4711/SensorApp'
+    (client_id, client_secret) = registerApp()
+    state = ''.join(random.choice(string.ascii_letters) for m in range(10))
+
+    service_information = ServiceInformation('https://www.authenix.eu/oauth/authorize',
+                                             'https://www.authenix.eu/oauth/token',
+                                             client_id,
+                                             client_secret,
+                                             scopes)
+    manager = CredentialManager(service_information)
+    manager.init_with_token(refresh_token)
+    _logger.debug('Access Token = %s', manager._access_token)
+    _logger.debug('Refresh Token = %s', manager.refresh_token)
+
+    return manager._access_token, manager.refresh_token
+
 def authorize():
-    scopes = ['openid', 'profile', 'citiobs.secd.eu#create', 'citiobs.secd.eu#update']
+    scopes = ['openid', 'profile', 'citiobs.secd.eu#create', 'citiobs.secd.eu#update', 'offline_access']
     redirect_uri = 'http://127.0.0.1:4711/SensorApp'
     (client_id, client_secret) = registerApp()
     state = ''.join(random.choice(string.ascii_letters) for m in range(10))
@@ -161,9 +183,9 @@ def authorize():
     _logger.info(data)
     manager.init_with_authorize_code(redirect_uri, code)
     _logger.debug('Access Token = %s', manager._access_token)
-    # Here access and refresh token may be used with self.refresh_token
+    _logger.debug('Refresh Token = %s', manager.refresh_token)
 
-    return manager._access_token, data
+    return manager._access_token, manager.refresh_token, data
 
 def connect_mqtt(token):
     def on_connect(client, userdata, flags, rc):
@@ -171,15 +193,17 @@ def connect_mqtt(token):
             print("Connected to MQTT Broker!")
         else:
             print("Failed to connect, return code %d\n", rc)
+
     # Set Connecting Client ID
     client = mqtt_client.Client(client_id)
     client.username_pw_set('Bearer', token)
     client.on_connect = on_connect
     client.connect(broker, port)
+    #client.connect('localhost', port)
     return client
 
 
-def publish(service, client, ids):
+def publish(service, client, ids, party):
     thing = service.things().query().filter("id eq '" + ids.get('thing_id') + "'") #.expand("Locations").list().get(0)
     thing.locations = [location]
     lon = location.location['coordinates'][0]
@@ -281,14 +305,20 @@ def publish(service, client, ids):
             pm10.result = float(v_pm10)
 
             print('publishing...')
-            client.publish("v1.1/Observations", json.dumps(transform_entity_to_json_dict(temperature)))
-            client.publish("v1.1/Observations", json.dumps(transform_entity_to_json_dict(humidity)))
-            client.publish("v1.1/Observations", json.dumps(transform_entity_to_json_dict(light)))
-            client.publish("v1.1/Observations", json.dumps(transform_entity_to_json_dict(pressure)))
-            client.publish("v1.1/Observations", json.dumps(transform_entity_to_json_dict(noise)))
-            client.publish("v1.1/Observations", json.dumps(transform_entity_to_json_dict(pm1)))
-            client.publish("v1.1/Observations", json.dumps(transform_entity_to_json_dict(pm25)))
-            client.publish("v1.1/Observations", json.dumps(transform_entity_to_json_dict(pm10)))
+            observations = [
+                transform_entity_to_json_dict(temperature),
+                transform_entity_to_json_dict(humidity),
+                transform_entity_to_json_dict(light),
+                transform_entity_to_json_dict(pressure),
+                transform_entity_to_json_dict(noise),
+                transform_entity_to_json_dict(pm1),
+                transform_entity_to_json_dict(pm25),
+                transform_entity_to_json_dict(pm10),
+            ]
+            #create ObservationGroup and publish
+            group = staPlus.Group("OG {}".format(now), description=" ", creation_time=now, end_time=now, party=party)
+            group.observations = [temperature, humidity, light, pressure, noise, pm1, pm25, pm10]
+            client.publish("v1.1/ObservationGroups", json.dumps(transform_entity_to_json_dict(group)))
             print('done.')
 
         time.sleep(10)
@@ -533,23 +563,38 @@ def setup(service, user, location):
     return {'thing_id': str(raspi.id), 'temp_id': dsTemperatureId, 'humidity_id' : dsHumidityId, 'light_id': dsLightId, 'noise_id': dsNoiseId,
             'pressure_id': dsPressureId, 'pm1_id': dsPM1Id, 'pm25_id': dsPM25Id, 'pm10_id': dsPM10Id}
 
+def on_disconnect(client, userdata, rc):
+    print("Disconnected with result code: %s", rc)
+    reconnect_count, reconnect_delay = 0, FIRST_RECONNECT_DELAY
+    while reconnect_count < MAX_RECONNECT_COUNT:
+        print("Reconnecting in %d seconds...", reconnect_delay)
+        time.sleep(reconnect_delay)
+
+        try:
+            client.reconnect()
+            print("Reconnected successfully!")
+            return
+        except Exception as err:
+            print("%s. Reconnect failed. Retrying...", err)
+
+        reconnect_delay *= RECONNECT_RATE
+        reconnect_delay = min(reconnect_delay, MAX_RECONNECT_DELAY)
+        reconnect_count += 1
+    print("Reconnect failed after %s attempts. Exiting...", reconnect_count)
+
+
+def on_publish(mosq, obj, mid):
+    print("mid: "+str(mid))
 
 if __name__ == "__main__":
-    token, user = authorize()
-    auth = auth_handler.AuthHandler(token)
+    access_token, refresh_token, user = authorize()
+    auth = auth_handler.AuthHandler(access_token)
     service = staPlus.STAplusService(url, auth_handler=auth)
-    _logger.debug("processing with access token: " + token)
-    if LOCAL:
-        with hosts({"citiobs.demo.secure-dimensions.de": "192.168.1.10"}):
-            ids = setup(service, user, location)
-            client = connect_mqtt(token)
-            client.loop_start()
-            publish(service, client, ids)
-            client.loop_stop()
-    else:
-        ids = setup(service, user, location)
-        sys.exit
-        client = connect_mqtt(token)
-        client.loop_start()
-        publish(service, client, ids)
-        client.loop_stop()
+    party = service.parties().find(user['sub'])
+    _logger.debug("processing with access token: " + access_token)
+    ids = setup(service, user, location)
+    client = connect_mqtt(access_token)
+    client.on_disconnect = on_disconnect
+    client.loop()
+    publish(service, client, ids, party)
+
