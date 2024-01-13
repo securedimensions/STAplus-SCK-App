@@ -51,9 +51,9 @@ MAX_RECONNECT_DELAY = 60
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 _logger = logging.getLogger()
 
-url = "https://citiobs.demo.secure-dimensions.de/staplus/v1.1"
+url = "https://citiobs.demo.secure-dimensions.de/staplustest/v1.1"
 broker = 'citiobs.demo.secure-dimensions.de'
-port = 1883
+port = 2883
 topic = "v1.1/Observations"
 client_id = f'python-mqtt-{random.randint(0, 1000)}'
 kit_id = '16526'
@@ -590,9 +590,9 @@ if __name__ == "__main__":
     access_token, refresh_token, user = authorize()
     auth = auth_handler.AuthHandler(access_token)
     service = staPlus.STAplusService(url, auth_handler=auth)
-    party = service.parties().find(user['sub'])
     _logger.debug("processing with access token: " + access_token)
     ids = setup(service, user, location)
+    party = service.parties().find(user['sub'])
     client = connect_mqtt(access_token)
     client.on_disconnect = on_disconnect
     client.loop()
