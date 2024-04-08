@@ -195,7 +195,7 @@ def connect_mqtt(token):
             print("Failed to connect, return code %d\n", rc)
 
     # Set Connecting Client ID
-    client = mqtt_client.Client(client_id)
+    client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION1, client_id)
     client.username_pw_set('Bearer', token)
     client.on_connect = on_connect
     client.connect(broker, port)
