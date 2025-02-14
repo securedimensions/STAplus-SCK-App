@@ -20,11 +20,10 @@ import time
 import string
 import requests
 
-import frost_sta_client.model.feature_of_interest
-from frost_sta_client.utils import transform_entity_to_json_dict
-from geojson import Point
-from secd_staplus_client.service import auth_handler
-from secd_staplus_client import utils
+import staplus_client.model.feature_of_interest
+from staplus_client.utils import transform_entity_to_json_dict
+from geojson import Point, Feature
+from staplus_client.service import auth_handler
 from paho.mqtt import client as mqtt_client
 from datetime import datetime, timezone
 from serial import Serial
@@ -41,7 +40,7 @@ from typing import Tuple
 from oauth2_client.credentials_manager import ServiceInformation
 from oauth2_client.credentials_manager import CredentialManager
 
-import secd_staplus_client as staPlus
+import staplus_client as staPlus
 
 FIRST_RECONNECT_DELAY = 1
 RECONNECT_RATE = 2
@@ -58,11 +57,16 @@ topic = "v1.1/Observations"
 client_id = f'python-mqtt-{random.randint(0, 1000)}'
 kit_id = '16526'
 #location = staPlus.Location(name="Spitzingsee", description="A nice place on Earth", location=Point((11.885329792,47.659664028)), encoding_type='application/geo+json')
-location = staPlus.Location(name="Munich", description="A nice place on Earth", location=Point((11.509234,48.1107284)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Munich", description="A nice place on Earth", location=Point((11.509234,48.1107284)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="London", description="Geovation Hub", location=Point((-0.0996240,51.5244167)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Cape Town", description="A diverse place on Earth", location=Point((18.423300,-33.918861)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Dublin", description="A rainy place on Earth", location=Point((-6.222995, 53.306816)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Montreal", description="A pretty place on Earth", location=Point((-73.561668, 45.508888)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Montreal", description="Mont Royal Center", location=Point((-73.643059, 45.516109)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Schliersee", description="A nice place on Earth", location=Point((11.860125651759835,47.73457097754226)), encoding_type='application/geo+json')
+location = staPlus.Location(name="Thessaloniki", description="A sunny place on Earth", location=Point((22.951011263177264, 40.59529301861192)), encoding_type='application/geo+json')
 
-sck = Serial('/dev/tty.usbmodem401201', 115200, timeout=10)
+sck = Serial('/dev/tty.usbmodem14301', 115200, timeout=10)
 
 def generate_sha256_pkce(length: int) -> Tuple[str, str]:
     if not (43 <= length <= 128):
@@ -218,8 +222,12 @@ def publish(service, client, ids, party):
                 break
     if foi is None:
         p = Point((lon, lat))
-        foi = frost_sta_client.model.feature_of_interest.FeatureOfInterest(location.name, location.description, 'application/geo+json', p)
+        f = Feature(geometry=p)
+        print("f: ", f)
+        foi = staplus_client.model.feature_of_interest.FeatureOfInterest(location.name, location.description, 'application/geo+json', f)
         service.create(foi)
+
+    print("foi: ", vars(foi))
 
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     temperature = staPlus.Observation(None, None, now)
@@ -316,7 +324,7 @@ def publish(service, client, ids, party):
                 transform_entity_to_json_dict(pm10),
             ]
             #create ObservationGroup and publish
-            group = staPlus.Group("OG {}".format(now), description=" ", creation_time=now, end_time=now, party=party)
+            group = staPlus.ObservationGroup("OG {}".format(now), description=" ", creation_time=now, end_time=now, party=party)
             group.observations = [temperature, humidity, light, pressure, noise, pm1, pm25, pm10]
             client.publish("v1.1/ObservationGroups", json.dumps(transform_entity_to_json_dict(group)))
             print('done.')
