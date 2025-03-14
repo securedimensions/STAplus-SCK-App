@@ -1,7 +1,8 @@
-staplus-api-python-client@git+https://github.com/securedimensions/STAplus-Python-Client@STAplus
-oauth2-client@git+https://github.com/securedimensions/OAuth2Client.git
+sd-oauth2-client
+staplus-client
 cryptography
 PyJWT
 datetime
 pyserial
 paho-mqtt
+numpy
