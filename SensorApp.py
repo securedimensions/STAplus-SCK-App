@@ -57,16 +57,19 @@ topic = "v1.1/Observations"
 client_id = f'python-mqtt-{random.randint(0, 1000)}'
 kit_id = '16526'
 #location = staPlus.Location(name="Spitzingsee", description="A nice place on Earth", location=Point((11.885329792,47.659664028)), encoding_type='application/geo+json')
-#location = staPlus.Location(name="Munich", description="A nice place on Earth", location=Point((11.509234,48.1107284)), encoding_type='application/geo+json')
+location = staPlus.Location(name="Munich", description="A nice place on Earth", location=Point((11.509234,48.1107284)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="London", description="Geovation Hub", location=Point((-0.0996240,51.5244167)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Cape Town", description="A diverse place on Earth", location=Point((18.423300,-33.918861)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Dublin", description="A rainy place on Earth", location=Point((-6.222995, 53.306816)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Montreal", description="A pretty place on Earth", location=Point((-73.561668, 45.508888)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Montreal", description="Mont Royal Center", location=Point((-73.643059, 45.516109)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Schliersee", description="A nice place on Earth", location=Point((11.860125651759835,47.73457097754226)), encoding_type='application/geo+json')
-location = staPlus.Location(name="Thessaloniki", description="A sunny place on Earth", location=Point((22.951011263177264, 40.59529301861192)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Thessaloniki", description="A sunny place on Earth", location=Point((22.951011263177264, 40.59529301861192)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Rome", description="A sunny and nice place on Earth", location=Point((12.4634654,41.8358714)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Oslo", description="At Deichman Library, a nice place on Earth", location=Point((10.752602603269894,59.908823365033165)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Oslo", description="At Nedre Lokka Cocktail Bar :)", location=Point((10.759240260213346,59.91896661895605)), encoding_type='application/geo+json')
 
-sck = Serial('/dev/tty.usbmodem14301', 115200, timeout=10)
+sck = Serial('/dev/tty.usbmodem14401', 115200, timeout=10)
 
 def generate_sha256_pkce(length: int) -> Tuple[str, str]:
     if not (43 <= length <= 128):
@@ -262,6 +265,9 @@ def publish(service, client, ids, party):
     pm10.feature_of_interest = foi
     pm10.datastream = service.datastreams().find(ids.get('pm10_id'))
 
+    # CC-BY license for all datastreams
+    cc_by = service.licenses().find('CC_BY')
+
     sck.write('shell -on\nmonitor -noms Temperature,Humidity,Light,Noise dBA,Barometric pressure,PM 1.0,PM 2.5,PM 10.0\n'.encode('ASCII'))
     while True:
         data = None
@@ -326,6 +332,8 @@ def publish(service, client, ids, party):
             #create ObservationGroup and publish
             group = staPlus.ObservationGroup("OG {}".format(now), description=" ", creation_time=now, end_time=now, party=party)
             group.observations = [temperature, humidity, light, pressure, noise, pm1, pm25, pm10]
+            #data = json.dumps(transform_entity_to_json_dict(group))
+            #print(data)
             client.publish("v1.1/ObservationGroups", json.dumps(transform_entity_to_json_dict(group)))
             print('done.')
 
@@ -364,28 +372,28 @@ def setup(service, user, location):
     ds = service.datastreams().query().filter("Thing/id eq '" + str(raspi.id) + "'").expand("ObservedProperty").list()
 
     # Let's see if we can reuse Datastreams
-    temperature = staPlus.ObservedProperty('temp', 'http://vocabs.lter-europe.net/EnvThes/22035', 'Air Temperature')
+    temperature = staPlus.ObservedProperty('temp', 'http://www.eionet.europa.eu/gemet/concept/281', 'Air Temperature')
     dsTemperatureId = None
 
-    humidity = staPlus.ObservedProperty('RH', 'http://vocabs.lter-europe.net/EnvThes/21579', 'Relative Humidity')
+    humidity = staPlus.ObservedProperty('RH', 'https://qudt.org/vocab/quantitykind/RelativeHumidity', 'Relative Humidity')
     dsHumidityId = None
 
     light = staPlus.ObservedProperty('light', 'https://qudt.org/vocab/quantitykind/LuminousExposure', 'Ambient Light')
     dsLightId = None
 
-    noise = staPlus.ObservedProperty('noise', 'https://qudt.org/vocab/quantitykind/SoundExposureLevel', 'Noise Level')
+    noise = staPlus.ObservedProperty('noise', 'https://qudt.org/vocab/quantitykind/SoundPressureLevel', 'Noise Level')
     dsNoiseId = None
 
-    pressure = staPlus.ObservedProperty('pres', 'https://vocabs.lter-europe.net/EnvThes/22060', 'Barometric Pressure')
+    pressure = staPlus.ObservedProperty('pres', 'https://qudt.org/vocab/quantitykind/AtmosphericPressure', 'Barometric Pressure')
     dsPressureId = None
 
-    pm1 = staPlus.ObservedProperty('PM1', 'https://www.iqair.com/us/newsroom/pm1', 'Particulate matter with an average aerodynamic diameter of up to 1 micrometers')
+    pm1 = staPlus.ObservedProperty('PM1', 'http://dd.eionet.europa.eu/vocabulary/aq/pollutant/6002', 'Particulate matter with an average aerodynamic diameter of up to 1 micrometers')
     dsPM1Id = None
 
-    pm25 = staPlus.ObservedProperty('PM25', 'https://www.eea.europa.eu/help/glossary/eea-glossary/pm2.5', 'Particulate matter with an average aerodynamic diameter of up to 2.5 micrometers')
+    pm25 = staPlus.ObservedProperty('PM25', 'http://dd.eionet.europa.eu/vocabulary/aq/pollutant/6001', 'Particulate matter with an average aerodynamic diameter of up to 2.5 micrometers')
     dsPM25Id = None
 
-    pm10 = staPlus.ObservedProperty('PM10', 'https://www.eea.europa.eu/help/glossary/eea-glossary/pm10', 'Particulate matter with an average aerodynamic diameter of up to 10 micrometers')
+    pm10 = staPlus.ObservedProperty('PM10', 'http://dd.eionet.europa.eu/vocabulary/aq/pollutant/5', 'Particulate matter with an average aerodynamic diameter of up to 10 micrometers')
     dsPM10Id = None
 
     if ds.entities:
@@ -489,7 +497,7 @@ def setup(service, user, location):
         dsLightId = service.create(datastream)
 
     # Noise
-    db = staPlus.UnitOfMeasurement('A-weighted decibel', 'dBA', 'https://www.eea.europa.eu/help/glossary/eea-glossary/a-weighted-decibel')
+    db = staPlus.UnitOfMeasurement('A-weighted decibel', 'dBA', 'https://qudt.org/vocab/unit/DeciB_A')
     datastream = staPlus.Datastream('Noise Level', 'noise measured with the SmartCitizen Kit',
                                     'http://www.opengis.net/def/observationType/OGC-OM/2.0/OM_Measurement', db)
     datastream.observed_property = noise
@@ -506,8 +514,7 @@ def setup(service, user, location):
         dsNoiseId = service.create(datastream)
 
     # Pressure
-    kPa = staPlus.UnitOfMeasurement('kiloPascals', 'kPa',
-                                   'https://qudt.org/vocab/unit/KiloPA')
+    kPa = staPlus.UnitOfMeasurement('kiloPascals', 'kPa', 'https://qudt.org/vocab/unit/KiloPA')
     datastream = staPlus.Datastream('Barometric Pressure', 'air pressure measured with the SmartCitizen Kit',
                                     'http://www.opengis.net/def/observationType/OGC-OM/2.0/OM_Measurement', kPa)
     datastream.observed_property = pressure
@@ -524,7 +531,7 @@ def setup(service, user, location):
         dsPressureId = service.create(datastream)
 
     # Unit of measure for PM
-    ugm3 = staPlus.UnitOfMeasurement('Microgram per cubic meter', 'µg/m³', 'https://qudt.org/vocab/unit/MicroGM-PER-M3')
+    ugm3 = staPlus.UnitOfMeasurement('Microgram per cubic meter', 'µg/m³', 'http://dd.eionet.europa.eu/vocabulary/uom/concentration/ug.m-3')
 
     # Sensor for measuring PM
     sensorPM = staPlus.Sensor('Planttower PMS 5003', 'Planttower PMS 5003 Digital universal particle concentration sensor',
