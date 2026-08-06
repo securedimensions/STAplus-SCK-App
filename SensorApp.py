@@ -43,15 +43,16 @@ from oauth2_client.credentials_manager import CredentialManager
 import staplus_client as staPlus
 
 FIRST_RECONNECT_DELAY = 1
-RECONNECT_RATE = 2
-MAX_RECONNECT_COUNT = 12
 MAX_RECONNECT_DELAY = 60
+# Refresh MQTT bearer token before the typical 30-minute expiry
+TOKEN_REFRESH_INTERVAL = 25 * 60
 
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 _logger = logging.getLogger()
 
 url = "https://citiobs.demo.secure-dimensions.de/staplustest/v1.1"
-broker = 'citiobs.demo.secure-dimensions.de'
+#url = "http://localhost:8080/FROST-Server/v1.1"
+broker = '192.168.1.10'
 port = 2883
 topic = "v1.1/Observations"
 client_id = f'python-mqtt-{random.randint(0, 1000)}'
@@ -68,8 +69,15 @@ location = staPlus.Location(name="Munich", description="A nice place on Earth", 
 #location = staPlus.Location(name="Rome", description="A sunny and nice place on Earth", location=Point((12.4634654,41.8358714)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Oslo", description="At Deichman Library, a nice place on Earth", location=Point((10.752602603269894,59.908823365033165)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Oslo", description="At Nedre Lokka Cocktail Bar :)", location=Point((10.759240260213346,59.91896661895605)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Aix-en-Provence", description="A nice but very hot place on Earth", location=Point((5.4398124,43.5289402)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Rotterdam", description="VONK is a nice place on Earth", location=Point((4.4818404, 51.9219658)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Oulu", description="The University of Oulu is a very nice place", location=Point((25.4663717,65.0589239)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Oslo", description="NILU", location=Point((11.0505295,59.9753226)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Helsinki", description="Cumpula Campus", location=Point((24.9624645,60.2038549)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Timisoara", description="University West", location=Point((21.2168783,45.7428234)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Budapest", description="Hotel Continental", location=Point((19.0645204,47.4970053)), encoding_type='application/geo+json')
 
-sck = Serial('/dev/tty.usbmodem14401', 115200, timeout=10)
+sck = Serial('/dev/tty.usbmodem401301', 115200, timeout=10)
 
 def generate_sha256_pkce(length: int) -> Tuple[str, str]:
     if not (43 <= length <= 128):
@@ -194,19 +202,55 @@ def authorize():
 
     return manager._access_token, manager.refresh_token, data
 
-def connect_mqtt(token):
-    def on_connect(client, userdata, flags, rc):
-        if rc == 0:
+def refresh_mqtt_auth(client):
+    """Refresh OAuth tokens and update MQTT username/password for the next connect."""
+    userdata = client.user_data_get()
+    access_token, refresh_token = updateTokens(userdata['refresh_token'])
+    userdata['access_token'] = access_token
+    userdata['refresh_token'] = refresh_token
+    userdata['last_refresh'] = time.time()
+    client.username_pw_set('Bearer', access_token)
+    _logger.debug('MQTT credentials refreshed')
+    return access_token, refresh_token
+
+def connect_mqtt(token, refresh_token):
+    def on_connect(client, userdata, flags, reason_code, properties):
+        if reason_code == 0:
             print("Connected to MQTT Broker!")
         else:
-            print("Failed to connect, return code %d\n", rc)
+            print("Failed to connect, return code %s" % reason_code)
 
-    # Set Connecting Client ID
-    client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION1, client_id)
+    def on_disconnect(client, userdata, flags, reason_code, properties):
+        print("Disconnected with result code: %s" % reason_code)
+        if userdata.get('shutting_down'):
+            return
+        # Refresh credentials so paho's automatic reconnect uses a valid token.
+        # Do not sleep or call reconnect() here — that blocks the network loop.
+        try:
+            refresh_mqtt_auth(client)
+        except Exception as err:
+            print("Failed to refresh MQTT token before reconnect: %s" % err)
+
+    userdata = {
+        'access_token': token,
+        'refresh_token': refresh_token,
+        'last_refresh': time.time(),
+        'shutting_down': False,
+    }
+    client = mqtt_client.Client(
+        callback_api_version=mqtt_client.CallbackAPIVersion.VERSION2,
+        protocol=mqtt_client.MQTTv5,
+        client_id=client_id,
+        userdata=userdata,
+        reconnect_on_failure=True,
+    )
+    client.reconnect_delay_set(min_delay=FIRST_RECONNECT_DELAY, max_delay=MAX_RECONNECT_DELAY)
     client.username_pw_set('Bearer', token)
     client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     client.connect(broker, port)
     #client.connect('localhost', port)
+    client.loop_start()
     return client
 
 
@@ -270,6 +314,13 @@ def publish(service, client, ids, party):
 
     sck.write('shell -on\nmonitor -noms Temperature,Humidity,Light,Noise dBA,Barometric pressure,PM 1.0,PM 2.5,PM 10.0\n'.encode('ASCII'))
     while True:
+        userdata = client.user_data_get()
+        if time.time() - userdata.get('last_refresh', 0) >= TOKEN_REFRESH_INTERVAL:
+            try:
+                refresh_mqtt_auth(client)
+            except Exception as err:
+                print("Proactive MQTT token refresh failed: %s" % err)
+
         data = None
         while sck.in_waiting:
             data = sck.readline().decode('utf-8')
@@ -318,7 +369,7 @@ def publish(service, client, ids, party):
             pm10.result_time = now
             pm10.result = float(v_pm10)
 
-            print('publishing...')
+            print('publishing at ' + d)
             observations = [
                 transform_entity_to_json_dict(temperature),
                 transform_entity_to_json_dict(humidity),
@@ -329,11 +380,14 @@ def publish(service, client, ids, party):
                 transform_entity_to_json_dict(pm25),
                 transform_entity_to_json_dict(pm10),
             ]
+            print('Temperature   Humidity   Light  Pressure  Noise   PM1   PM2.5   PM10')
+            print(f"{temperature.result}         {humidity.result}      {light.result}  {pressure.result}    {noise.result}   {pm1.result}  {pm25.result}    {pm10.result}")
+            print(f"{temperature.datastream.id}         {humidity.datastream.id}      {light.datastream.id}  {pressure.datastream.id}    {noise.datastream.id}   {pm1.datastream.id}  {pm25.datastream.id}    {pm10.datastream.id}")
             #create ObservationGroup and publish
             group = staPlus.ObservationGroup("OG {}".format(now), description=" ", creation_time=now, end_time=now, party=party)
             group.observations = [temperature, humidity, light, pressure, noise, pm1, pm25, pm10]
-            #data = json.dumps(transform_entity_to_json_dict(group))
-            #print(data)
+            data = json.dumps(transform_entity_to_json_dict(group))
+            print(data)
             client.publish("v1.1/ObservationGroups", json.dumps(transform_entity_to_json_dict(group)))
             print('done.')
 
@@ -342,11 +396,15 @@ def publish(service, client, ids, party):
 def setup(service, user, location):
 
     preferred_username = user.get('preferred_username') if 'preferred_username' in user.keys() else ''
-    ljs = staPlus.Party(description='', display_name=preferred_username, role='individual')
-    ljs_id = service.create(ljs)
-    ljs = service.parties().find(ljs_id)
+    parties = service.parties().query().filter("authId eq '" + user['sub'] + "'")
+    if (len(parties.list().entities) == 0):
+        ljs = staPlus.Party(description='', display_name=preferred_username, role='individual')
+        ljs_id = service.create(ljs)
+    else:
+        ljs = parties.list().entities[0]
+        ljs_id = ljs.auth_id
 
-    result = service.parties().query().filter("authId eq '" + ljs.auth_id + "'").expand('Things').list()
+    result = service.parties().query().filter("authId eq '" + ljs_id + "'").expand('Things').list()
     thing_found = False
     raspi = None
     if result.entities[0].things.entities:
@@ -578,28 +636,8 @@ def setup(service, user, location):
     return {'thing_id': str(raspi.id), 'temp_id': dsTemperatureId, 'humidity_id' : dsHumidityId, 'light_id': dsLightId, 'noise_id': dsNoiseId,
             'pressure_id': dsPressureId, 'pm1_id': dsPM1Id, 'pm25_id': dsPM25Id, 'pm10_id': dsPM10Id}
 
-def on_disconnect(client, userdata, rc):
-    print("Disconnected with result code: %s", rc)
-    reconnect_count, reconnect_delay = 0, FIRST_RECONNECT_DELAY
-    while reconnect_count < MAX_RECONNECT_COUNT:
-        print("Reconnecting in %d seconds...", reconnect_delay)
-        time.sleep(reconnect_delay)
-
-        try:
-            client.reconnect()
-            print("Reconnected successfully!")
-            return
-        except Exception as err:
-            print("%s. Reconnect failed. Retrying...", err)
-
-        reconnect_delay *= RECONNECT_RATE
-        reconnect_delay = min(reconnect_delay, MAX_RECONNECT_DELAY)
-        reconnect_count += 1
-    print("Reconnect failed after %s attempts. Exiting...", reconnect_count)
-
-
-def on_publish(mosq, obj, mid):
-    print("mid: "+str(mid))
+def on_publish(client, userdata, mid, reason_code, properties):
+    print("mid: " + str(mid))
 
 if __name__ == "__main__":
     access_token, refresh_token, user = authorize()
@@ -608,8 +646,11 @@ if __name__ == "__main__":
     _logger.debug("processing with access token: " + access_token)
     ids = setup(service, user, location)
     party = service.parties().find(user['sub'])
-    client = connect_mqtt(access_token)
-    client.on_disconnect = on_disconnect
-    client.loop()
-    publish(service, client, ids, party)
+    client = connect_mqtt(access_token, refresh_token)
+    try:
+        publish(service, client, ids, party)
+    finally:
+        client.user_data_get()['shutting_down'] = True
+        client.loop_stop()
+        client.disconnect()
 
