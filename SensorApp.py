@@ -19,6 +19,7 @@ import random
 import time
 import string
 import requests
+import math
 
 import staplus_client.model.feature_of_interest
 from staplus_client.utils import transform_entity_to_json_dict
@@ -78,6 +79,61 @@ location = staPlus.Location(name="Munich", description="A nice place on Earth", 
 #location = staPlus.Location(name="Budapest", description="Hotel Continental", location=Point((19.0645204,47.4970053)), encoding_type='application/geo+json')
 
 sck = Serial('/dev/tty.usbmodem401301', 115200, timeout=10)
+
+def get_elevation(lat: float, lon: float, timeout: float = 10.0) -> float:
+    """
+    Look up ground elevation (meters above sea level) for a GPS coordinate
+    using the free Open-Elevation API.
+ 
+    Raises requests.RequestException on network/API failure.
+    """
+    _ELEVATION_API_URL = "https://api.open-elevation.com/api/v1/lookup"
+    resp = requests.get(
+        _ELEVATION_API_URL,
+        params={"locations": f"{lat},{lon}"},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return float(data["results"][0]["elevation"])
+
+def pressure_normalization_factor(
+    temperature: float = 15.0,
+    elevation: float = 0.0,
+) -> float:
+    """
+    Compute the multiplicative factor to normalize a raw barometric pressure
+    reading taken at elevation to its sea-level equivalent.
+ 
+    Usage:
+        factor = pressure_normalization_factor(20, 521)
+        p_sea_level = p_raw * factor
+ 
+    Parameters
+    ----------
+    temperature : float, optional
+        Local air temperature in Celsius. Defaults to 15degC (ICAO standard
+        atmosphere at sea level). Pass the sensor's own temperature reading
+        for better accuracy if available.
+    elevation : float, optional
+        Altitude above sea level in meters. If omitted, it is looked up
+        automatically from lat/lon (requires network access). Pass this
+        directly if you already have a GPS altitude fix (and have corrected
+        it from the WGS84 ellipsoid to orthometric/MSL height), to skip the
+        lookup and avoid its accuracy limitations.
+ 
+    Returns
+    -------
+    float
+        Multiplicative correction factor (>= 1.0 for elevation >= 0).
+    """
+    _G = 9.80665        # gravity, m/s^2
+    _M = 0.0289644      # molar mass of dry air, kg/mol
+    _R = 8.31447        # universal gas constant, J/(mol*K)
+    
+    t_kelvin = temperature + 273.15
+    factor = math.exp((_G * _M * elevation) / (_R * t_kelvin))
+    return factor
 
 def generate_sha256_pkce(length: int) -> Tuple[str, str]:
     if not (43 <= length <= 128):
@@ -254,8 +310,8 @@ def connect_mqtt(token, refresh_token):
     return client
 
 
-def publish(service, client, ids, party):
-    thing = service.things().query().filter("id eq '" + ids.get('thing_id') + "'") #.expand("Locations").list().get(0)
+def publish(service, client, config, party):
+    thing = service.things().query().filter("id eq '" + config.get('thing_id') + "'") #.expand("Locations").list().get(0)
     thing.locations = [location]
     lon = location.location['coordinates'][0]
     lat = location.location['coordinates'][1]
@@ -279,35 +335,35 @@ def publish(service, client, ids, party):
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     temperature = staPlus.Observation(None, None, now)
     temperature.feature_of_interest = foi
-    temperature.datastream = service.datastreams().find(ids.get('temp_id'))
+    temperature.datastream = service.datastreams().find(config.get('temp_id'))
 
     humidity = staPlus.Observation(None, None, now)
     humidity.feature_of_interest = foi
-    humidity.datastream = service.datastreams().find(ids.get('humidity_id'))
+    humidity.datastream = service.datastreams().find(config.get('humidity_id'))
 
     light = staPlus.Observation(None, None, now)
     light.feature_of_interest = foi
-    light.datastream = service.datastreams().find(ids.get('light_id'))
+    light.datastream = service.datastreams().find(config.get('light_id'))
 
     noise = staPlus.Observation(None, None, now)
     noise.feature_of_interest = foi
-    noise.datastream = service.datastreams().find(ids.get('noise_id'))
+    noise.datastream = service.datastreams().find(config.get('noise_id'))
 
     pressure = staPlus.Observation(None, None, now)
     pressure.feature_of_interest = foi
-    pressure.datastream = service.datastreams().find(ids.get('pressure_id'))
+    pressure.datastream = service.datastreams().find(config.get('pressure_id'))
 
     pm1 = staPlus.Observation(None, None, now)
     pm1.feature_of_interest = foi
-    pm1.datastream = service.datastreams().find(ids.get('pm1_id'))
+    pm1.datastream = service.datastreams().find(config.get('pm1_id'))
 
     pm25 = staPlus.Observation(None, None, now)
     pm25.feature_of_interest = foi
-    pm25.datastream = service.datastreams().find(ids.get('pm25_id'))
+    pm25.datastream = service.datastreams().find(config.get('pm25_id'))
 
     pm10 = staPlus.Observation(None, None, now)
     pm10.feature_of_interest = foi
-    pm10.datastream = service.datastreams().find(ids.get('pm10_id'))
+    pm10.datastream = service.datastreams().find(config.get('pm10_id'))
 
     # CC-BY license for all datastreams
     cc_by = service.licenses().find('CC_BY')
@@ -353,9 +409,11 @@ def publish(service, client, ids, party):
             noise.result_time = now
             noise.result = float(n)
 
+            pressure_factor = pressure_normalization_factor(temperature.result, config['elevation'])
+            
             pressure.phenomenon_time = d
             pressure.result_time = now
-            pressure.result = float(p)
+            pressure.result = round(float(p) * pressure_factor, 2)
 
             pm1.phenomenon_time = d
             pm1.result_time = now
@@ -370,6 +428,8 @@ def publish(service, client, ids, party):
             pm10.result = float(v_pm10)
 
             print('publishing at ' + d)
+            print("pressure factor: ", pressure_factor)
+            
             observations = [
                 transform_entity_to_json_dict(temperature),
                 transform_entity_to_json_dict(humidity),
@@ -384,10 +444,10 @@ def publish(service, client, ids, party):
             print(f"{temperature.result}         {humidity.result}      {light.result}  {pressure.result}    {noise.result}   {pm1.result}  {pm25.result}    {pm10.result}")
             print(f"{temperature.datastream.id}         {humidity.datastream.id}      {light.datastream.id}  {pressure.datastream.id}    {noise.datastream.id}   {pm1.datastream.id}  {pm25.datastream.id}    {pm10.datastream.id}")
             #create ObservationGroup and publish
-            group = staPlus.ObservationGroup("OG {}".format(now), description=" ", creation_time=now, end_time=now, party=party)
+            group = staPlus.ObservationGroup("OG {}".format(now), description=" ", creation_time=now, end_time=now, party=party, license=cc_by)
             group.observations = [temperature, humidity, light, pressure, noise, pm1, pm25, pm10]
             data = json.dumps(transform_entity_to_json_dict(group))
-            print(data)
+            #print(data)
             client.publish("v1.1/ObservationGroups", json.dumps(transform_entity_to_json_dict(group)))
             print('done.')
 
@@ -395,10 +455,10 @@ def publish(service, client, ids, party):
 
 def setup(service, user, location):
 
-    preferred_username = user.get('preferred_username') if 'preferred_username' in user.keys() else ''
     parties = service.parties().query().filter("authId eq '" + user['sub'] + "'")
     if (len(parties.list().entities) == 0):
-        ljs = staPlus.Party(description='', display_name=preferred_username, role='individual')
+        preferred_username = user.get('preferred_username') if 'preferred_username' in user.keys() else ''
+        ljs = staPlus.Party(description=q'', display_name=preferred_username, role='individual')
         ljs_id = service.create(ljs)
     else:
         ljs = parties.list().entities[0]
@@ -426,6 +486,9 @@ def setup(service, user, location):
         raspi.party = ljs
         raspiId = service.create(raspi)
         raspi = service.things().find(raspiId)
+
+    lon, lat = location.location.coordinates
+    elevation = get_elevation(lat, lon)
 
     ds = service.datastreams().query().filter("Thing/id eq '" + str(raspi.id) + "'").expand("ObservedProperty").list()
 
@@ -634,7 +697,7 @@ def setup(service, user, location):
         dsPM10Id = service.create(datastream)
 
     return {'thing_id': str(raspi.id), 'temp_id': dsTemperatureId, 'humidity_id' : dsHumidityId, 'light_id': dsLightId, 'noise_id': dsNoiseId,
-            'pressure_id': dsPressureId, 'pm1_id': dsPM1Id, 'pm25_id': dsPM25Id, 'pm10_id': dsPM10Id}
+            'pressure_id': dsPressureId, 'pm1_id': dsPM1Id, 'pm25_id': dsPM25Id, 'pm10_id': dsPM10Id, 'elevation': elevation}
 
 def on_publish(client, userdata, mid, reason_code, properties):
     print("mid: " + str(mid))
@@ -644,11 +707,11 @@ if __name__ == "__main__":
     auth = auth_handler.AuthHandler(access_token)
     service = staPlus.STAplusService(url, auth_handler=auth)
     _logger.debug("processing with access token: " + access_token)
-    ids = setup(service, user, location)
+    config = setup(service, user, location)
     party = service.parties().find(user['sub'])
     client = connect_mqtt(access_token, refresh_token)
     try:
-        publish(service, client, ids, party)
+        publish(service, client, config, party)
     finally:
         client.user_data_get()['shutting_down'] = True
         client.loop_stop()
