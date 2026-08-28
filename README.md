@@ -1,6 +1,27 @@
 # Smart Citizen Kit publishes on STAplus
 The application `SensorApp` publishes observations from the Smart Citizen Kit v2.1 to a SensorThings PLUS API endpoint.
 
+## GDPR note
+The STAplus data model allows to attach the acting user to the `Thing` and the `Datastream` for example. The `Thing` is associated with `Location` and `HistoricalLocation` 
+entity types. The `Datastream` used by the implementation to record the observations is also associated to `Party` representing the acting user.
+
+In case that the `Party/role` property has the value `individual`, the acting user is a human person. In that case, this implementation is recording personal data (spatio-temporal tuple) via the `Thing/Location` and `Thing/HistoricalLocation` and the `Datastream/Observation`. The `Thing/Location` provides the space and the `Observation/phenomenonTime` provides the temporal context. 
+
+Therefore, the service endpoint used by this application to upload observations for human users (`Party/role == 'individual'`) must protect access to 
+the the `Locations` and `HistoricalLocations` entity types to avoid leaking of personal information!
+
+To avoid the creation of personal information via the `FeatureOfInterest`, it is suggested to not use a geometry unless the observed feature is a publically 
+observable object like a lake, a public park, a public building etc. In these cases, the `FeatureOfInterest/Feature/geometry` may describe the spatial extend
+of the feature. In case the feature is a private home, the garden of the acting user, etc. the geometry should be set to `null`.
+
+The latest update of this application uploads the observations with a feature of interest that is "The World" and there is no geometry. It is up to the 
+user to change that feature of interest accordingly before starting to upload observations.
+
+The configured STAplus endpoint used by the latest update of this implementation is compliant with the STAplus 1.0.1 corrigendum which explicitly
+introduces a GDPR compliance note. This means that access to `/Locations` and `HistoricalLocations` is only granted for the user that is linked to the `Thing/Party`.
+In particular, the authentication access token's Bearer token must be equal to the `Thing/Party/authId`. For any anonymous or other user's access 
+the service returns an empty JSON array for `/Locations` or `HistoricalLocations`.
+
 **DISCLAIMER: This software is in development stage and therefore probably buggy. Please report issues to improve the code**
 ## Hardware
 To run the application, a Raspberry PI or another computer running Linux or MAC OS is required.

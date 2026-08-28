@@ -320,17 +320,14 @@ def publish(service, client, config, party):
     lat = location.location['coordinates'][1]
 
     foi = None
-    fois = service.features_of_interest().query().list()
+    fois = service.features_of_interest().query().filter("substringof('World',name)").list()
     if fois.entities:
         for f in fois.entities:
-            if 'coordinates' in f.feature.keys() and f.feature['coordinates'][0] == lon and f.feature['coordinates'][1] == lat:
-                foi = f
-                break
+            foi = f
+            break
     if foi is None:
-        p = Point((lon, lat))
-        f = Feature(geometry=p)
-        print("f: ", f)
-        foi = staplus_client.model.feature_of_interest.FeatureOfInterest(location.name, location.description, 'application/geo+json', f)
+        f = Feature(geometry=None)
+        foi = staplus_client.model.feature_of_interest.FeatureOfInterest(name="The World", description="somewhere on this planet", encoding_type='application/geo+json', feature=f)
         service.create(foi)
 
     print("foi: ", vars(foi))
