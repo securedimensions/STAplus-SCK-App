@@ -26,6 +26,7 @@ from staplus_client.utils import transform_entity_to_json_dict
 from geojson import Point, Feature
 from staplus_client.service import auth_handler
 from paho.mqtt import client as mqtt_client
+from paho.mqtt.enums import MQTTErrorCode  # For paho-mqtt v2.x readability
 from datetime import datetime, timezone
 from serial import Serial
 
@@ -53,8 +54,10 @@ _logger = logging.getLogger()
 
 url = "https://citiobs.demo.secure-dimensions.de/staplustest/v1.1"
 #url = "http://localhost:8080/FROST-Server/v1.1"
-broker = '192.168.1.10'
+broker = 'citiobs.demo.secure-dimensions.de'
+#broker = '127.0.0.1'
 port = 2883
+#port = 1883
 topic = "v1.1/Observations"
 client_id = f'python-mqtt-{random.randint(0, 1000)}'
 kit_id = '16526'
@@ -334,39 +337,39 @@ def publish(service, client, config, party):
 
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     temperature = staPlus.Observation(None, None, now)
-    temperature.feature_of_interest = foi
-    temperature.datastream = service.datastreams().find(config.get('temp_id'))
+    temperature.feature_of_interest = foi.clone()
+    temperature.datastream = service.datastreams().find(config.get('temp_id')).clone()
 
     humidity = staPlus.Observation(None, None, now)
-    humidity.feature_of_interest = foi
-    humidity.datastream = service.datastreams().find(config.get('humidity_id'))
+    humidity.feature_of_interest = foi.clone()
+    humidity.datastream = service.datastreams().find(config.get('humidity_id')).clone()
 
     light = staPlus.Observation(None, None, now)
-    light.feature_of_interest = foi
-    light.datastream = service.datastreams().find(config.get('light_id'))
+    light.feature_of_interest = foi.clone()
+    light.datastream = service.datastreams().find(config.get('light_id')).clone()
 
     noise = staPlus.Observation(None, None, now)
-    noise.feature_of_interest = foi
-    noise.datastream = service.datastreams().find(config.get('noise_id'))
+    noise.feature_of_interest = foi.clone()
+    noise.datastream = service.datastreams().find(config.get('noise_id')).clone()
 
     pressure = staPlus.Observation(None, None, now)
-    pressure.feature_of_interest = foi
-    pressure.datastream = service.datastreams().find(config.get('pressure_id'))
+    pressure.feature_of_interest = foi.clone()
+    pressure.datastream = service.datastreams().find(config.get('pressure_id')).clone()
 
     pm1 = staPlus.Observation(None, None, now)
-    pm1.feature_of_interest = foi
-    pm1.datastream = service.datastreams().find(config.get('pm1_id'))
+    pm1.feature_of_interest = foi.clone()
+    pm1.datastream = service.datastreams().find(config.get('pm1_id')).clone()
 
     pm25 = staPlus.Observation(None, None, now)
-    pm25.feature_of_interest = foi
-    pm25.datastream = service.datastreams().find(config.get('pm25_id'))
+    pm25.feature_of_interest = foi.clone()
+    pm25.datastream = service.datastreams().find(config.get('pm25_id')).clone()
 
     pm10 = staPlus.Observation(None, None, now)
-    pm10.feature_of_interest = foi
-    pm10.datastream = service.datastreams().find(config.get('pm10_id'))
+    pm10.feature_of_interest = foi.clone()
+    pm10.datastream = service.datastreams().find(config.get('pm10_id')).clone()
 
     # CC-BY license for all datastreams
-    cc_by = service.licenses().find('CC_BY')
+    cc_by = service.licenses().find(config['license_id'])
 
     sck.write('shell -on\nmonitor -noms Temperature,Humidity,Light,Noise dBA,Barometric pressure,PM 1.0,PM 2.5,PM 10.0\n'.encode('ASCII'))
     while True:
@@ -444,12 +447,20 @@ def publish(service, client, config, party):
             print(f"{temperature.result}         {humidity.result}      {light.result}  {pressure.result}    {noise.result}   {pm1.result}  {pm25.result}    {pm10.result}")
             print(f"{temperature.datastream.id}         {humidity.datastream.id}      {light.datastream.id}  {pressure.datastream.id}    {noise.datastream.id}   {pm1.datastream.id}  {pm25.datastream.id}    {pm10.datastream.id}")
             #create ObservationGroup and publish
-            group = staPlus.ObservationGroup("OG {}".format(now), description=" ", creation_time=now, end_time=now, party=party, license=cc_by)
+            group = staPlus.ObservationGroup("OG {}".format(now), description=" ", creation_time=now, end_time=now, party=party.clone(), license=cc_by.clone())
             group.observations = [temperature, humidity, light, pressure, noise, pm1, pm25, pm10]
             data = json.dumps(transform_entity_to_json_dict(group))
-            #print(data)
-            client.publish("v1.1/ObservationGroups", json.dumps(transform_entity_to_json_dict(group)))
-            print('done.')
+            print(data)
+            msg_info = client.publish("v1.1/ObservationGroups", json.dumps(transform_entity_to_json_dict(group)))
+            try:
+                msg_info.wait_for_publish(timeout=5)
+            except RuntimeError as e:
+                print(f"Publish timeout error: {e}")
+
+            print("--- MQTTMessageInfo Details ---")
+            print(f"Message ID (mid)    : {msg_info.mid}")
+            print(f"Result Code (rc)    : {msg_info.rc}")
+            print(f"Is Fully Delivered? : {msg_info.is_published()}")
 
         time.sleep(10)
 
@@ -458,7 +469,7 @@ def setup(service, user, location):
     parties = service.parties().query().filter("authId eq '" + user['sub'] + "'")
     if (len(parties.list().entities) == 0):
         preferred_username = user.get('preferred_username') if 'preferred_username' in user.keys() else ''
-        ljs = staPlus.Party(description=q'', display_name=preferred_username, role='individual')
+        ljs = staPlus.Party(description='', display_name=preferred_username, role='individual')
         ljs_id = service.create(ljs)
     else:
         ljs = parties.list().entities[0]
@@ -555,6 +566,12 @@ def setup(service, user, location):
 
     # CC-BY license for all datastreams
     cc_by = service.licenses().find('CC_BY')
+    cc_by_clone = staPlus.License(name=cc_by.name, 
+                                  definition=cc_by.definition, 
+                                  logo=cc_by.logo,
+                                  description='My CC_BY', 
+                                  attribution_text='contributed by Secure Dimensions')
+    cc_by_clone_id = service.create(cc_by_clone)
 
     # Air Temperature and Humidity
     sensorTemperatureHumidity = staPlus.Sensor('Sensirion SHT31', 'Sensirion SHT31 Humidity and Temperature Sensor', 'application/pdf',
@@ -567,7 +584,7 @@ def setup(service, user, location):
     datastream.observed_property = temperature
     datastream.party = ljs
     datastream.thing = raspi
-    datastream.license = cc_by
+    datastream.license = cc_by_clone
     datastream.sensor = sensorTemperatureHumidity
 
     if dsTemperatureId is None:
@@ -587,7 +604,7 @@ def setup(service, user, location):
     datastream.observed_property = humidity
     datastream.party = ljs
     datastream.thing = raspi
-    datastream.license = cc_by
+    datastream.license = cc_by_clone
     datastream.sensor = sensorTemperatureHumidity
 
     if dsHumidityId is None:
@@ -607,7 +624,7 @@ def setup(service, user, location):
     datastream.observed_property = light
     datastream.party = ljs
     datastream.thing = raspi
-    datastream.license = cc_by
+    datastream.license = cc_by_clone
     sensor = staPlus.Sensor('Rohm BH1721FVC', 'Rohm BH1721FVC Digital 16bit Serial Output Type Ambient Light Sensor ICt',
                             'application/pdf',
                             {'description': 'https://www.seeedstudio.com/Smart-Citizen-Starter-Kit-p-2865.html'},
@@ -624,7 +641,7 @@ def setup(service, user, location):
     datastream.observed_property = noise
     datastream.party = ljs
     datastream.thing = raspi
-    datastream.license = cc_by
+    datastream.license = cc_by_clone
     sensor = staPlus.Sensor('Invensense ICS-434342', 'Invensense ICS-434342. Low‐Noise Microphone with I2S Digital Output',
                             'application/pdf',
                             {'description': 'https://www.seeedstudio.com/Smart-Citizen-Starter-Kit-p-2865.html'},
@@ -641,7 +658,7 @@ def setup(service, user, location):
     datastream.observed_property = pressure
     datastream.party = ljs
     datastream.thing = raspi
-    datastream.license = cc_by
+    datastream.license = cc_by_clone
     sensor = staPlus.Sensor('MPL3115A2S', 'I2C precision pressure sensor with altimetry',
                             'application/pdf',
                             {'description': 'https://www.seeedstudio.com/Smart-Citizen-Starter-Kit-p-2865.html'},
@@ -666,7 +683,7 @@ def setup(service, user, location):
     datastream.observed_property = pm1
     datastream.party = ljs
     datastream.thing = raspi
-    datastream.license = cc_by
+    datastream.license = cc_by_clone
     datastream.sensor = sensorPM
 
     if dsPM1Id is None:
@@ -678,7 +695,7 @@ def setup(service, user, location):
     datastream.observed_property = pm25
     datastream.party = ljs
     datastream.thing = raspi
-    datastream.license = cc_by
+    datastream.license = cc_by_clone
     datastream.sensor = sensorPM
 
     if dsPM25Id is None:
@@ -690,14 +707,14 @@ def setup(service, user, location):
     datastream.observed_property = pm10
     datastream.party = ljs
     datastream.thing = raspi
-    datastream.license = cc_by
+    datastream.license = cc_by_clone
     datastream.sensor = sensorPM
 
     if dsPM10Id is None:
         dsPM10Id = service.create(datastream)
 
     return {'thing_id': str(raspi.id), 'temp_id': dsTemperatureId, 'humidity_id' : dsHumidityId, 'light_id': dsLightId, 'noise_id': dsNoiseId,
-            'pressure_id': dsPressureId, 'pm1_id': dsPM1Id, 'pm25_id': dsPM25Id, 'pm10_id': dsPM10Id, 'elevation': elevation}
+            'pressure_id': dsPressureId, 'pm1_id': dsPM1Id, 'pm25_id': dsPM25Id, 'pm10_id': dsPM10Id, 'elevation': elevation, 'license_id': cc_by_clone_id}
 
 def on_publish(client, userdata, mid, reason_code, properties):
     print("mid: " + str(mid))
