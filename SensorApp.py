@@ -30,6 +30,7 @@ from paho.mqtt.enums import MQTTErrorCode  # For paho-mqtt v2.x readability
 from datetime import datetime, timezone
 from serial import Serial
 
+import h3
 import base64
 import hashlib
 import logging
@@ -43,6 +44,7 @@ from oauth2_client.credentials_manager import ServiceInformation
 from oauth2_client.credentials_manager import CredentialManager
 
 import staplus_client as staPlus
+import sta_dggs_client as dggs
 
 FIRST_RECONNECT_DELAY = 1
 MAX_RECONNECT_DELAY = 60
@@ -52,11 +54,11 @@ TOKEN_REFRESH_INTERVAL = 25 * 60
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 _logger = logging.getLogger()
 
-url = "https://citiobs.demo.secure-dimensions.de/staplustest/v1.1"
+url = "https://citiobs.demo.secure-dimensions.de/stapluscelltest/v1.1"
 #url = "http://localhost:8080/FROST-Server/v1.1"
 broker = 'citiobs.demo.secure-dimensions.de'
 #broker = '127.0.0.1'
-port = 2883
+port = 3883
 #port = 1883
 topic = "v1.1/Observations"
 client_id = f'python-mqtt-{random.randint(0, 1000)}'
@@ -81,7 +83,11 @@ location = staPlus.Location(name="Munich", description="A nice place on Earth", 
 #location = staPlus.Location(name="Timisoara", description="University West", location=Point((21.2168783,45.7428234)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Budapest", description="Hotel Continental", location=Point((19.0645204,47.4970053)), encoding_type='application/geo+json')
 
-sck = Serial('/dev/tty.usbmodem401301', 115200, timeout=10)
+# Cell resolution
+resolution = 9
+
+# USB connection to the SCK
+sck = Serial('/dev/tty.usbmodem14101', 115200, timeout=10)
 
 def get_elevation(lat: float, lon: float, timeout: float = 10.0) -> float:
     """
@@ -477,7 +483,7 @@ def setup(service, user, location):
     raspi = None
     if result.entities[0].things.entities:
         for thing in result.entities[0].things.entities:
-            if thing.properties['sck_id'] == kit_id:
+            if 'sck_id' in thing.properties and thing.properties['sck_id'] == kit_id:
                 thing_found = True
                 print(json.dumps(transform_entity_to_json_dict(location)))
                 location.things = [thing]
@@ -497,6 +503,17 @@ def setup(service, user, location):
 
     lon, lat = location.location.coordinates
     elevation = get_elevation(lat, lon)
+    
+    cell_id = h3.latlng_to_cell(lat, lon, resolution)                    
+            
+    response = service.execute("GET", service.url.url)
+    conformance = response.json()["serverSettings"]["conformance"]
+
+    dggs_enabled = False
+    for c in conformance:
+        if (c == 'http://www.opengis.net/spec/sensorthings-dggs/1.0/conf/core'):
+            dggs_enabled = True
+            break;
 
     ds = service.datastreams().query().filter("Thing/id eq '" + str(raspi.id) + "'").expand("ObservedProperty").list()
 
@@ -583,6 +600,8 @@ def setup(service, user, location):
     datastream.thing = raspi
     datastream.license = cc_by_clone
     datastream.sensor = sensorTemperatureHumidity
+    if dggs_enabled:
+        datastream.cell = dggs.Cell(cell_id).clone()
 
     if dsTemperatureId is None:
         if raspi.datastreams is not None:
@@ -603,6 +622,8 @@ def setup(service, user, location):
     datastream.thing = raspi
     datastream.license = cc_by_clone
     datastream.sensor = sensorTemperatureHumidity
+    if dggs_enabled:
+            datastream.cell = dggs.Cell(cell_id).clone()
 
     if dsHumidityId is None:
         if raspi.datastreams is not None:
@@ -627,6 +648,8 @@ def setup(service, user, location):
                             {'description': 'https://www.seeedstudio.com/Smart-Citizen-Starter-Kit-p-2865.html'},
                             'https://fscdn.rohm.com/en/products/databook/datasheet/ic/sensor/light/bh1721fvc-e.pdf')
     datastream.sensor = sensor
+    if dggs_enabled:
+            datastream.cell = dggs.Cell(cell_id).clone()
 
     if dsLightId is None:
         dsLightId = service.create(datastream)
@@ -644,6 +667,8 @@ def setup(service, user, location):
                             {'description': 'https://www.seeedstudio.com/Smart-Citizen-Starter-Kit-p-2865.html'},
                             'https://invensense.tdk.com/wp-content/uploads/2015/02/ICS-43432-data-sheet-v1.3.pdf')
     datastream.sensor = sensor
+    if dggs_enabled:
+            datastream.cell = dggs.Cell(cell_id).clone()
 
     if dsNoiseId is None:
         dsNoiseId = service.create(datastream)
@@ -661,6 +686,8 @@ def setup(service, user, location):
                             {'description': 'https://www.seeedstudio.com/Smart-Citizen-Starter-Kit-p-2865.html'},
                             'https://www.nxp.com/docs/en/data-sheet/MPL3115A2S.pdf')
     datastream.sensor = sensor
+    if dggs_enabled:
+            datastream.cell = dggs.Cell(cell_id).clone()
 
     if dsPressureId is None:
         dsPressureId = service.create(datastream)
@@ -682,6 +709,8 @@ def setup(service, user, location):
     datastream.thing = raspi
     datastream.license = cc_by_clone
     datastream.sensor = sensorPM
+    if dggs_enabled:
+            datastream.cell = dggs.Cell(cell_id).clone()
 
     if dsPM1Id is None:
         dsPM1Id = service.create(datastream)
@@ -694,6 +723,8 @@ def setup(service, user, location):
     datastream.thing = raspi
     datastream.license = cc_by_clone
     datastream.sensor = sensorPM
+    if dggs_enabled:
+            datastream.cell = dggs.Cell(cell_id).clone()
 
     if dsPM25Id is None:
         dsPM25Id = service.create(datastream)
@@ -706,6 +737,8 @@ def setup(service, user, location):
     datastream.thing = raspi
     datastream.license = cc_by_clone
     datastream.sensor = sensorPM
+    if dggs_enabled:
+            datastream.cell = dggs.Cell(cell_id).clone()
 
     if dsPM10Id is None:
         dsPM10Id = service.create(datastream)
@@ -719,7 +752,7 @@ def on_publish(client, userdata, mid, reason_code, properties):
 if __name__ == "__main__":
     access_token, refresh_token, user = authorize()
     auth = auth_handler.AuthHandler(access_token)
-    service = staPlus.STAplusService(url, auth_handler=auth)
+    service = dggs.compose(url, auth_handler=auth)
     _logger.debug("processing with access token: " + access_token)
     config = setup(service, user, location)
     party = service.parties().find(user['sub'])

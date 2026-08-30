@@ -1,5 +1,6 @@
 sd-oauth2-client
 staplus-client
+sta-dggs-client
 cryptography
 PyJWT
 datetime
