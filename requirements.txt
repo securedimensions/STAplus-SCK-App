@@ -7,3 +7,4 @@ datetime
 pyserial
 paho-mqtt
 numpy
+h3
