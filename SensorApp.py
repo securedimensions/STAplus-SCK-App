@@ -64,13 +64,13 @@ topic = "v1.1/Observations"
 client_id = f'python-mqtt-{random.randint(0, 1000)}'
 kit_id = '16526'
 #location = staPlus.Location(name="Spitzingsee", description="A nice place on Earth", location=Point((11.885329792,47.659664028)), encoding_type='application/geo+json')
-location = staPlus.Location(name="Munich", description="A nice place on Earth", location=Point((11.509234,48.1107284)), encoding_type='application/geo+json')
+#location = staPlus.Location(name="Munich", description="A nice place on Earth", location=Point((11.509234,48.1107284)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="London", description="Geovation Hub", location=Point((-0.0996240,51.5244167)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Cape Town", description="A diverse place on Earth", location=Point((18.423300,-33.918861)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Dublin", description="A rainy place on Earth", location=Point((-6.222995, 53.306816)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Montreal", description="A pretty place on Earth", location=Point((-73.561668, 45.508888)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Montreal", description="Mont Royal Center", location=Point((-73.643059, 45.516109)), encoding_type='application/geo+json')
-#location = staPlus.Location(name="Schliersee", description="A nice place on Earth", location=Point((11.860125651759835,47.73457097754226)), encoding_type='application/geo+json')
+location = staPlus.Location(name="Schliersee", description="A nice place on Earth", location=Point((11.860125651759835,47.73457097754226)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Thessaloniki", description="A sunny place on Earth", location=Point((22.951011263177264, 40.59529301861192)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Rome", description="A sunny and nice place on Earth", location=Point((12.4634654,41.8358714)), encoding_type='application/geo+json')
 #location = staPlus.Location(name="Oslo", description="At Deichman Library, a nice place on Earth", location=Point((10.752602603269894,59.908823365033165)), encoding_type='application/geo+json')
@@ -518,28 +518,28 @@ def setup(service, user, location):
     ds = service.datastreams().query().filter("Thing/id eq '" + str(raspi.id) + "'").expand("ObservedProperty").list()
 
     # Let's see if we can reuse Datastreams
-    temperature = staPlus.ObservedProperty('temp', 'http://www.eionet.europa.eu/gemet/concept/281', 'Air Temperature')
+    temperature = staPlus.ObservedProperty('temp', 'https://vocabs.lter-europe.net/EnvThes/en/page/22035', 'Air Temperature')
     dsTemperatureId = None
 
-    humidity = staPlus.ObservedProperty('RH', 'https://qudt.org/vocab/quantitykind/RelativeHumidity', 'Relative Humidity')
+    humidity = staPlus.ObservedProperty('RH', 'http://vocabs.lter-europe.net/EnvThes/22032', 'Relative Humidity')
     dsHumidityId = None
 
     light = staPlus.ObservedProperty('light', 'https://qudt.org/vocab/quantitykind/LuminousExposure', 'Ambient Light')
     dsLightId = None
 
-    noise = staPlus.ObservedProperty('noise', 'https://qudt.org/vocab/quantitykind/SoundPressureLevel', 'Noise Level')
+    noise = staPlus.ObservedProperty('noise', 'https://www.merriam-webster.com/dictionary/noise', 'Noise Level')
     dsNoiseId = None
 
     pressure = staPlus.ObservedProperty('pres', 'https://qudt.org/vocab/quantitykind/AtmosphericPressure', 'Barometric Pressure')
     dsPressureId = None
 
-    pm1 = staPlus.ObservedProperty('PM1', 'http://dd.eionet.europa.eu/vocabulary/aq/pollutant/6002', 'Particulate matter with an average aerodynamic diameter of up to 1 micrometers')
+    pm1 = staPlus.ObservedProperty('PM1', 'http://codes.wmo.int/wmdr/ParticleSizeRange/60', 'Particulate matter with an average aerodynamic diameter of up to 1 micrometers')
     dsPM1Id = None
 
-    pm25 = staPlus.ObservedProperty('PM25', 'http://dd.eionet.europa.eu/vocabulary/aq/pollutant/6001', 'Particulate matter with an average aerodynamic diameter of up to 2.5 micrometers')
+    pm25 = staPlus.ObservedProperty('PM25', 'https://codes.wmo.int/wmdr/ParticleSizeRange/_70', 'Particulate matter with an average aerodynamic diameter of up to 2.5 micrometers')
     dsPM25Id = None
 
-    pm10 = staPlus.ObservedProperty('PM10', 'http://dd.eionet.europa.eu/vocabulary/aq/pollutant/5', 'Particulate matter with an average aerodynamic diameter of up to 10 micrometers')
+    pm10 = staPlus.ObservedProperty('PM10', 'https://codes.wmo.int/wmdr/ParticleSizeRange/_100', 'Particulate matter with an average aerodynamic diameter of up to 10 micrometers')
     dsPM10Id = None
 
     if ds.entities:
