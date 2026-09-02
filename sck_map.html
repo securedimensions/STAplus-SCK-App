@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>SCK location</title>
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css"/>
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <style>
+    html, body, #map { margin: 0; padding: 0; height: 100%; width: 100%; }
+    .hint {
+      position: absolute; z-index: 1000; left: 12px; bottom: 12px;
+      background: rgba(255,255,255,0.92); padding: 8px 10px; border-radius: 6px;
+      font: 13px/1.3 system-ui, sans-serif; box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+      max-width: 280px;
+    }
+    #locate {
+      position: absolute; z-index: 1000; right: 12px; top: 12px;
+      font: 13px system-ui, sans-serif; padding: 6px 10px;
+    }
+    .sck-popup .leaflet-popup-content {
+      margin: 8px 10px 10px;
+      min-width: 300px;
+    }
+    .sck-charts {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px 12px;
+      font: 11px/1.2 system-ui, sans-serif;
+      color: #222;
+    }
+    .sck-chart-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-weight: 600;
+    }
+    .sck-chart-head .val { font-variant-numeric: tabular-nums; font-weight: 500; }
+    .sck-chart canvas {
+      display: block;
+      width: 100%;
+      height: 42px;
+    }
+    .sck-charts-caption {
+      grid-column: 1 / -1;
+      color: #666;
+      font: 11px system-ui, sans-serif;
+    }
+    .sck-charts-empty {
+      grid-column: 1 / -1;
+      color: #666;
+      font: 12px system-ui, sans-serif;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <button id="locate" type="button">Use my location</button>
+  <div class="hint">Click the map or drag the marker to set the Thing location. Confirm in the app before publishing. After the kit is connected, click the marker for live charts.</div>
+  <script>
+    let map, marker, bridge;
+    let chartData = [];
+    let kitConnected = false;
+    let openOnFirstReading = false;
+    const CHART_WINDOW_S = 30 * 60;
+    const SERIES = [
+      { key: "temperature", label: "Temp °C", color: "#d9480f" },
+      { key: "humidity", label: "Humidity %", color: "#1c7ed6" },
+      { key: "light", label: "Light lux", color: "#f59f00" },
+      { key: "noise", label: "Noise dBA", color: "#7048e8" },
+      { key: "pressure", label: "Pressure kPa", color: "#0ca678" },
+      { key: "pm1", label: "PM1", color: "#495057" },
+      { key: "pm25", label: "PM2.5", color: "#c92a2a" },
+      { key: "pm10", label: "PM10", color: "#e8590c" }
+    ];
+
+    function setMarker(lat, lon, pan) {
+      if (lat == null || lon == null || Number.isNaN(lat) || Number.isNaN(lon)) {
+        return;
+      }
+      if (!map) {
+        initMap();
+        if (!map) {
+          setTimeout(function () { setMarker(lat, lon, pan); }, 50);
+          return;
+        }
+      }
+      if (marker) {
+        marker.setLatLng([lat, lon]);
+      } else {
+        marker = L.marker([lat, lon], { draggable: true }).addTo(map);
+        marker.on("dragstart", function () {
+          if (marker.isPopupOpen()) marker.closePopup();
+        });
+        marker.on("dragend", function () {
+          const p = marker.getLatLng();
+          if (bridge) bridge.markerMovedTo(p.lat, p.lng);
+        });
+        marker.on("popupopen", function () {
+          if (!kitConnected) {
+            marker.closePopup();
+            return;
+          }
+          requestAnimationFrame(redrawCharts);
+        });
+        marker.on("popupclose", function () {
+          openOnFirstReading = false;
+        });
+        marker.bindTooltip("Connect the kit, then click the marker for charts", {
+          direction: "top",
+          offset: [0, -12],
+          opacity: 0.95
+        });
+      }
+      if (kitConnected) ensureChartPopup();
+      if (pan) map.setView([lat, lon], Math.max(map.getZoom(), 13));
+      if (bridge) bridge.markerMovedTo(lat, lon);
+    }
+
+    window.sckMarkerCoords = function () {
+      if (!marker) return "";
+      const p = marker.getLatLng();
+      return String(p.lat) + "," + String(p.lng);
+    };
+
+    function chartPopupHtml() {
+      let html = '<div class="sck-charts">';
+      html += '<div class="sck-charts-caption" id="sck-charts-caption">Up to 30 minutes</div>';
+      html += '<div class="sck-charts-empty" id="sck-charts-empty">Connect the kit to plot readings.</div>';
+      SERIES.forEach(function (s) {
+        html += '<div class="sck-chart" data-key="' + s.key + '">';
+        html += '<div class="sck-chart-head"><span>' + s.label + '</span><span class="val">—</span></div>';
+        html += '<canvas></canvas></div>';
+      });
+      html += "</div>";
+      return html;
+    }
+
+    function ensureChartPopup() {
+      if (!marker || !kitConnected) return;
+      if (marker.getPopup()) return;
+      marker.bindPopup(chartPopupHtml(), {
+        maxWidth: 380,
+        minWidth: 300,
+        className: "sck-popup",
+        autoPan: true,
+        autoClose: false,
+        closeOnClick: false
+      });
+    }
+
+    function setChartTooltip() {
+      if (!marker || !marker.getTooltip()) return;
+      marker.setTooltipContent(
+        kitConnected
+          ? "Click the marker to open the charts"
+          : "Connect the kit, then click the marker for charts"
+      );
+    }
+
+    window.sckKit = function (on) {
+      kitConnected = !!on;
+      setChartTooltip();
+      if (!kitConnected) {
+        chartData = [];
+        openOnFirstReading = false;
+        if (marker && marker.isPopupOpen()) marker.closePopup();
+        if (marker && marker.getPopup()) marker.unbindPopup();
+        return;
+      }
+      openOnFirstReading = true;
+      ensureChartPopup();
+    };
+
+    function rowTime(row) {
+      const t = Number(row.ts != null ? row.ts : row._ts);
+      return Number.isFinite(t) ? t : null;
+    }
+
+    function trimChartData() {
+      const cutoff = Date.now() / 1000 - CHART_WINDOW_S;
+      const kept = [];
+      chartData.forEach(function (row) {
+        const t = rowTime(row);
+        if (t == null || t >= cutoff) kept.push(row);
+      });
+      if (kept.length > 3600) {
+        chartData = kept.slice(kept.length - 3600);
+      } else {
+        chartData = kept;
+      }
+    }
+
+    function drawSpark(canvas, rows, key, color) {
+      const dpr = window.devicePixelRatio || 1;
+      const cssW = canvas.clientWidth || 140;
+      const cssH = canvas.clientHeight || 42;
+      canvas.width = Math.max(1, Math.round(cssW * dpr));
+      canvas.height = Math.max(1, Math.round(cssH * dpr));
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cssW, cssH);
+      const vals = [];
+      (rows || []).forEach(function (row) {
+        const v = Number(row[key]);
+        if (Number.isFinite(v)) vals.push(v);
+      });
+      if (!vals.length) return;
+      const min = Math.min.apply(null, vals);
+      const max = Math.max.apply(null, vals);
+      const span = max - min || 1;
+      const n = vals.length;
+      const pad = 2;
+      const innerW = cssW - pad * 2;
+      const innerH = cssH - pad * 2;
+      ctx.beginPath();
+      vals.forEach(function (v, i) {
+        const x = n === 1 ? pad : pad + (i / (n - 1)) * innerW;
+        const y = cssH - pad - ((v - min) / span) * innerH;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.6;
+      ctx.lineJoin = "round";
+      ctx.stroke();
+      const lastX = n === 1 ? pad : pad + innerW;
+      const lastY = cssH - pad - ((vals[n - 1] - min) / span) * innerH;
+      ctx.beginPath();
+      ctx.arc(lastX, lastY, 2.2, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
+
+    function redrawCharts() {
+      const popup = marker && marker.getPopup && marker.getPopup();
+      if (!popup) return;
+      const el = popup.getElement();
+      if (!el) return;
+      const empty = el.querySelector("#sck-charts-empty");
+      if (empty) empty.style.display = chartData.length ? "none" : "block";
+      const caption = el.querySelector("#sck-charts-caption");
+      if (caption) {
+        caption.textContent = chartData.length
+          ? (chartData.length + " samples · up to 30 min")
+          : "Up to 30 minutes";
+      }
+      SERIES.forEach(function (s) {
+        const box = el.querySelector('.sck-chart[data-key="' + s.key + '"]');
+        if (!box) return;
+        const values = [];
+        chartData.forEach(function (row) {
+          const n = Number(row[s.key]);
+          if (Number.isFinite(n)) values.push(n);
+        });
+        const valEl = box.querySelector(".val");
+        if (valEl) {
+          valEl.textContent = values.length ? values[values.length - 1].toFixed(2) : "—";
+        }
+        const canvas = box.querySelector("canvas");
+        if (canvas) drawSpark(canvas, chartData, s.key, s.color);
+      });
+    }
+
+    window.sckCharts = function (points) {
+      if (!Array.isArray(points)) return;
+      if (!points.length) {
+        chartData = [];
+      } else {
+        const incoming = points[points.length - 1];
+        const copy = {};
+        Object.keys(incoming).forEach(function (k) { copy[k] = incoming[k]; });
+        copy.ts = Date.now() / 1000;
+        copy._ts = copy.ts;
+        chartData.push(copy);
+        trimChartData();
+      }
+      if (!marker || !kitConnected) return;
+      ensureChartPopup();
+      if (points.length && openOnFirstReading && !marker.isPopupOpen()) {
+        openOnFirstReading = false;
+        marker.openPopup();
+      }
+      if (marker.isPopupOpen()) {
+        requestAnimationFrame(redrawCharts);
+      }
+    };
+
+    function initMap(attempt) {
+      attempt = attempt || 0;
+      if (typeof L === "undefined") {
+        if (attempt < 40) {
+          setTimeout(function () { initMap(attempt + 1); }, 50);
+        }
+        return;
+      }
+      if (map) {
+        map.invalidateSize();
+        return;
+      }
+      map = L.map("map", { closePopupOnClick: false }).setView([20, 0], 2);
+      window.map = map;
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution: "&copy; OpenStreetMap"
+      }).addTo(map);
+      map.on("click", function (e) {
+        setMarker(e.latlng.lat, e.latlng.lng, false);
+      });
+      document.getElementById("locate").onclick = function () {
+        if (bridge && bridge.requestLocation) {
+          bridge.requestLocation();
+        }
+      };
+      setTimeout(function () { map.invalidateSize(); }, 200);
+    }
+
+    window.sckBoot = function (lat, lon) {
+      const la = Number(lat);
+      const lo = Number(lon);
+      initMap();
+      if (Number.isFinite(la) && Number.isFinite(lo)) {
+        setMarker(la, lo, true);
+      }
+    };
+
+    function start() {
+      if (typeof qt !== "undefined" && qt.webChannelTransport && typeof QWebChannel === "function") {
+        new QWebChannel(qt.webChannelTransport, function (channel) {
+          bridge = channel.objects.bridge;
+          initMap();
+        });
+      } else {
+        initMap();
+      }
+    }
+
+    start();
+  </script>
+</body>
+</html>

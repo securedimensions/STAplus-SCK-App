@@ -8,3 +8,5 @@ pyserial
 paho-mqtt
 numpy
 h3
+PyQt6
+PyQt6-WebEngine
