@@ -20,11 +20,22 @@ from urllib.parse import unquote
 def _ensure_webengine_flags():
     if sys.platform != "win32":
         return
-    current = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
-    if "CalculateNativeWinOcclusion" in current:
-        return
-    extra = "--disable-features=CalculateNativeWinOcclusion"
-    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (current + " " + extra).strip()
+    parts = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").split()
+    features = []
+    kept = []
+    for item in parts:
+        if item.startswith("--disable-features="):
+            features.extend(name for name in item.split("=", 1)[1].split(",") if name)
+        else:
+            kept.append(item)
+    for name in ("CalculateNativeWinOcclusion", "WebGPU"):
+        if name not in features:
+            features.append(name)
+    kept.append("--disable-features=" + ",".join(features))
+    for flag in ("--ignore-gpu-blocklist", "--enable-unsafe-swiftshader"):
+        if flag not in kept:
+            kept.append(flag)
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(kept)
 
 
 _ensure_webengine_flags()
@@ -795,6 +806,7 @@ class MainWindow(QMainWindow):
         settings = self.map_page.settings()
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
         self._grant_geolocation()
         self._map_file_fallback = False
         self._geo_source = None
