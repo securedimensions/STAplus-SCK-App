@@ -1,0 +1,11 @@
+{
+  "application_type": "DeviceApp",
+  "audiences": ["3042e50b-dc09-4817-b34c-1b06c709da78"],
+  "client_id": "17974ba8-746b-4e50-bcc8-6a087ac0e685",
+  "client_name": "CitiObs Trusted Sensor App",
+  "grant_types": ["urn:ietf:params:oauth:grant-type:device_code"],
+  "response_types": ["id_token", "urn:ietf:params:oauth:grant-type:device_code"],
+  "scope": "openid profile idp offline_access citiobs.secd.eu#create",
+  "software_version": "0.1",
+  "token_endpoint_auth_method": "none"
+}
