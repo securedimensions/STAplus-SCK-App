@@ -51,7 +51,7 @@ from PyQt6.QtCore import (
 QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
 QCoreApplication.setApplicationName("STAplus-SCK")
 
-from PyQt6.QtGui import QCloseEvent, QIcon
+from PyQt6.QtGui import QCloseEvent, QDesktopServices, QIcon
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWebEngineCore import (
     QWebEnginePage,
@@ -66,6 +66,7 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -312,19 +313,93 @@ def locate_helper_path():
     return None
 
 
+def _location_settings_url():
+    if sys.platform == "win32":
+        return QUrl("ms-settings:privacy-location")
+    if sys.platform == "darwin":
+        return QUrl(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"
+        )
+    return None
+
+
+def _open_os_location_settings():
+    url = _location_settings_url()
+    if url is not None:
+        QDesktopServices.openUrl(url)
+
+
 def _location_settings_help():
     if sys.platform == "win32":
         return (
-            "Could not get the computer location. In Windows Settings, turn on Location "
-            "and allow desktop apps to access it, then try Use my location again. "
-            "You can also click the map."
+            "STAplus SCK cannot read this computer’s location until Windows allows it.\n\n"
+            "1. Open Settings → Privacy & security → Location.\n"
+            "2. Turn on Location services.\n"
+            "3. Turn on “Let desktop apps access your location”.\n\n"
+            "When those switches are on, come back here and confirm below. "
+            "The marker will then move to your current location."
         )
     if sys.platform == "darwin":
         return (
-            "Could not get the computer location. Allow STAplus SCK in System Settings → "
-            "Privacy & Security → Location Services if macOS asked."
+            "STAplus SCK cannot read this computer’s location until macOS allows it.\n\n"
+            "1. Open System Settings → Privacy & Security → Location Services.\n"
+            "2. Turn on Location Services.\n"
+            "3. Enable STAplus SCK (or sck-locate).\n\n"
+            "When that is done, come back here and confirm below."
         )
-    return "Could not get the computer location. Click the map to place the marker."
+    return (
+        "This app cannot read the computer location. Enable location access for "
+        "this application in your system settings, then confirm below."
+    )
+
+
+class LocationAccessDialog(QDialog):
+    """Stays up until the user confirms they enabled OS location access."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Enable location access")
+        self.setModal(True)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        flags = (
+            Qt.WindowType.Dialog
+            | Qt.WindowType.CustomizeWindowHint
+            | Qt.WindowType.WindowTitleHint
+        )
+        self.setWindowFlags(flags)
+        self.setMinimumWidth(460)
+
+        body = QLabel(_location_settings_help())
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        if _location_settings_url() is not None:
+            open_btn = QPushButton("Open Location settings")
+            open_btn.clicked.connect(_open_os_location_settings)
+            buttons.addWidget(open_btn)
+        done_btn = QPushButton("I have enabled location access")
+        done_btn.setDefault(True)
+        done_btn.clicked.connect(self.accept)
+        buttons.addWidget(done_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(body)
+        layout.addSpacing(8)
+        layout.addLayout(buttons)
+
+    def reject(self):
+        return
+
+    def closeEvent(self, event: QCloseEvent):
+        event.ignore()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            event.ignore()
+            return
+        super().keyPressEvent(event)
 
 
 def list_serial_ports():
@@ -749,6 +824,7 @@ class MainWindow(QMainWindow):
         self.browser_stack.addWidget(self.login_view)
         self._locate_proc = None
         self._locate_interactive = True
+        self._location_prompt_open = False
         self._locate_timeout = QTimer(self)
         self._locate_timeout.setSingleShot(True)
         self._locate_timeout.timeout.connect(self._on_locate_timeout)
@@ -1067,6 +1143,14 @@ class MainWindow(QMainWindow):
             if hasattr(self._geo_source, "errorOccurred"):
                 self._geo_source.errorOccurred.connect(self._on_qt_position_error)
         self._locate_interactive = interactive
+        try:
+            from PyQt6.QtPositioning import QGeoPositionInfoSource
+            if self._geo_source.error() == QGeoPositionInfoSource.Error.AccessError:
+                if interactive:
+                    self._on_location_denied()
+                return True
+        except Exception:
+            pass
         self.statusBar().showMessage("Finding current location…")
         self._locate_timeout.start(22000)
         try:
@@ -1129,14 +1213,26 @@ class MainWindow(QMainWindow):
             self._on_location_unavailable()
 
     def _on_location_denied(self):
-        self.statusBar().showMessage("Location permission denied. Click the map or “Use my location”.")
+        self.statusBar().showMessage("Location permission denied. Enable access, then confirm in the dialog.")
         if self._locate_interactive:
-            QMessageBox.warning(self, "Location", _location_settings_help())
+            self._prompt_location_settings()
 
     def _on_location_unavailable(self):
-        self.statusBar().showMessage("Could not get the current location. Click the map or “Use my location”.")
+        self.statusBar().showMessage("Could not get the current location. Enable access, then confirm in the dialog.")
         if self._locate_interactive:
-            QMessageBox.warning(self, "Location", _location_settings_help())
+            self._prompt_location_settings()
+
+    def _prompt_location_settings(self):
+        if self._location_prompt_open:
+            return
+        self._location_prompt_open = True
+        try:
+            dialog = LocationAccessDialog(self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.statusBar().showMessage("Finding current location…")
+                QTimer.singleShot(400, lambda: self._request_os_location(interactive=True))
+        finally:
+            self._location_prompt_open = False
 
     def _stop_locate_proc(self):
         proc = self._locate_proc

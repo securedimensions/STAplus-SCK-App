@@ -18,6 +18,20 @@
     #locate {
       position: absolute; z-index: 1000; right: 12px; top: 12px;
       font: 13px system-ui, sans-serif; padding: 6px 10px;
+      cursor: pointer;
+    }
+    /* Grab-hand hotspot is the palm. Crosshair clicks at the intersection. */
+    .leaflet-container,
+    .leaflet-grab,
+    .leaflet-grab .leaflet-interactive {
+      cursor: crosshair !important;
+    }
+    .leaflet-marker-icon,
+    .leaflet-marker-shadow {
+      cursor: grab;
+    }
+    .leaflet-dragging .leaflet-marker-draggable {
+      cursor: grabbing;
     }
     .sck-popup .leaflet-popup-content {
       margin: 8px 10px 10px;
@@ -391,6 +405,9 @@
       }
       map = L.map("map", { closePopupOnClick: false }).setView([20, 0], 2);
       window.map = map;
+      if (map._container) {
+        map._container.classList.add("leaflet-crosshair");
+      }
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
         maxZoom: 19,
         attribution: "&copy; OpenStreetMap"
