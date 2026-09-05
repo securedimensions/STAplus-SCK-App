@@ -61,6 +61,8 @@ OAUTH_SCOPES = [
 ]
 # STAplus demo API audience registered with AUTHENIX (client registration only).
 STA_AUDIENCE = "3042e50b-dc09-4817-b34c-1b06c709da78"
+OAUTH_SOFTWARE_ID = "b8815b0ff48b66ed3adbecb5d405fb15d941dbdb"
+OAUTH_SOFTWARE_VERSION = "1.3"
 AUTHENIX_ORIGIN = "https://authenix.eu"
 AUTHENIX_AUTHORIZE = AUTHENIX_ORIGIN + "/oauth/authorize"
 AUTHENIX_TOKEN = AUTHENIX_ORIGIN + "/oauth/token"
@@ -187,7 +189,7 @@ def _as_string_list(value):
     if value is None:
         return []
     if isinstance(value, str):
-        return [part for part in value.split() if part]
+        return [part for part in value.replace(",", " ").split() if part]
     if isinstance(value, (list, tuple)):
         return [str(part) for part in value if part]
     return []
@@ -200,6 +202,28 @@ def _valid_client_metadata(meta):
         return False
     grants = _as_string_list(meta.get("grant_types"))
     return "authorization_code" in grants
+
+
+def _client_metadata_expired(meta):
+    if not isinstance(meta, dict):
+        return True
+    expires = meta.get("expires")
+    if expires is not None:
+        try:
+            return int(time.time()) >= int(expires)
+        except (TypeError, ValueError):
+            return True
+    issued = meta.get("client_id_issued_at")
+    if issued is not None:
+        try:
+            return int(time.time()) >= int(issued) + 7 * 24 * 3600
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
+def _usable_client_metadata(meta):
+    return _valid_client_metadata(meta) and not _client_metadata_expired(meta)
 
 
 def _http_session():
@@ -254,9 +278,34 @@ def _load_sensor_app_json():
                 data = json.load(handle)
         except (OSError, json.JSONDecodeError):
             continue
-        if _valid_client_metadata(data):
+        if _usable_client_metadata(data):
             return data, path
     return {}, None
+
+
+def _register_error_text(body, response):
+    if not isinstance(body, dict):
+        return (response.text or "")[:300] or "unknown error"
+    return (
+        body.get("error_description")
+        or body.get("error")
+        or (response.text or "")[:300]
+        or "unknown error"
+    )
+
+
+def _register_needs_new_client(detail, body):
+    text = "%s %s" % (detail or "", json.dumps(body, default=str) if isinstance(body, dict) else "")
+    text = text.lower()
+    return any(
+        token in text
+        for token in (
+            "client_id not found",
+            "invalid_client",
+            "unknown client",
+            "expired",
+        )
+    )
 
 
 def _register_web_client():
@@ -266,7 +315,7 @@ def _register_web_client():
         "post_logout_redirect_uris": [OAUTH_LOGOUT_REDIRECT_URI],
         "logout_uri": OAUTH_LOGOUT_REDIRECT_URI,
         "audiences": [STA_AUDIENCE],
-        "grant_types": ["authorization_code", "refresh_token"],
+        "grant_types": ["authorization_code"],
         "response_types": ["code", "code id_token"],
         "client_name": "STAplus SCK App",
         "logo_uri": AUTHENIX_REGISTER_LOGO_URI,
@@ -281,55 +330,56 @@ def _register_web_client():
         "operator_country": "de",
         "tos_uri": "https://www.secure-dimensions.de/terms",
         "policy_uri": "https://www.secure-dimensions.de/privacy",
-        "software_id": "b8815b0ff48b66ed3adbecb5d405fb15d941dbdb",
-        "software_version": "1.2",
+        "software_id": OAUTH_SOFTWARE_ID,
+        "software_version": OAUTH_SOFTWARE_VERSION,
         "token_endpoint_auth_method": "client_secret_basic",
     }
     last_detail = "unknown error"
-    for attempt in range(2):
-        if attempt:
-            time.sleep(11)
-        response = _http_session().post(
-            AUTHENIX_REGISTER,
-            json=request,
-            headers={"Accept": "application/json"},
-            timeout=30,
-            proxies={},
-        )
-        try:
-            body = response.json()
-        except ValueError:
-            body = {}
-        if response.status_code == 200 and _valid_client_metadata(body):
-            return body
-        if response.status_code == 429:
-            last_detail = "AUTHENIX registration rate-limited"
-            continue
-        last_detail = body.get("error_description") or body.get("error") or response.text[:300]
+    versions = [OAUTH_SOFTWARE_VERSION, "%s.%s" % (OAUTH_SOFTWARE_VERSION, int(time.time()))]
+    for version in versions:
+        request["software_version"] = version
+        for attempt in range(2):
+            if attempt:
+                time.sleep(11)
+            response = _http_session().post(
+                AUTHENIX_REGISTER,
+                json=request,
+                headers={"Accept": "application/json"},
+                timeout=30,
+                proxies={},
+            )
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+            if response.status_code == 200 and _usable_client_metadata(body):
+                return body
+            if response.status_code == 200 and _valid_client_metadata(body):
+                last_detail = "AUTHENIX returned an expired client"
+                break
+            if response.status_code == 429:
+                last_detail = "AUTHENIX registration rate-limited"
+                continue
+            last_detail = _register_error_text(body, response)
+            if _register_needs_new_client(last_detail, body):
+                break
+            if response.status_code != 429:
+                raise RuntimeError("App registration failed: %s" % last_detail)
     raise RuntimeError("App registration failed: %s" % last_detail)
 
 
 def registerApp() -> Tuple[str, str]:
     dest = os.path.join(os.getcwd(), "SensorApp.json")
     app_metadata, loaded_from = _load_sensor_app_json()
-    register = not _valid_client_metadata(app_metadata)
-    if _valid_client_metadata(app_metadata):
-        expires = app_metadata.get("expires")
-        if expires is not None:
-            try:
-                if int(time.time()) >= int(expires):
-                    register = True
-            except (TypeError, ValueError):
-                pass
+    register = not _usable_client_metadata(app_metadata)
 
     if register:
         app_metadata = _register_web_client()
         with open(dest, "w", encoding="utf-8") as handle:
             json.dump(app_metadata, handle)
     elif loaded_from and os.path.abspath(loaded_from) != os.path.abspath(dest):
-        if os.path.basename(loaded_from) != "SensorApp.json_":
-            with open(dest, "w", encoding="utf-8") as handle:
-                json.dump(app_metadata, handle)
+        with open(dest, "w", encoding="utf-8") as handle:
+            json.dump(app_metadata, handle)
 
     client_id = app_metadata["client_id"]
     client_secret = app_metadata.get("client_secret") or ""

@@ -144,7 +144,7 @@ def _oauth_json_usable(path):
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-        return sckapp._valid_client_metadata(data)
+        return sckapp._usable_client_metadata(data)
     except (OSError, json.JSONDecodeError, TypeError):
         return False
 
@@ -156,8 +156,17 @@ def _prepare_frozen_workdir():
     support = _app_support_dir()
     os.makedirs(support, exist_ok=True)
     dest = os.path.join(support, "SensorApp.json")
+    if os.path.isfile(dest) and not _oauth_json_usable(dest):
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
     bundled = os.path.join(_bundle_dir(), "SensorApp.json")
-    if os.path.isfile(bundled) and (not os.path.isfile(dest) or not _oauth_json_usable(dest)):
+    if (
+        not os.path.isfile(dest)
+        and os.path.isfile(bundled)
+        and _oauth_json_usable(bundled)
+    ):
         shutil.copy2(bundled, dest)
     os.chdir(support)
 
