@@ -49,7 +49,7 @@ Left-hand cards (each can be collapsed from its title):
 4. **STAplus** — **Start publishing** / **Stop**
 5. **Live readings** — latest sample; after the kit is connected, click the map marker for charts
 
-The map is on the right. Click or drag the marker, then confirm it before publishing. On macOS, **Use my location** uses the bundled `sck-locate` helper (Core Location). Enable Location Services for STAplus SCK if macOS asks.
+The map is on the right. Click or drag the marker, then confirm it before publishing. **Use my location** uses the computer’s location: on macOS the bundled `sck-locate` helper (enable Location Services for STAplus SCK if macOS asks); on Windows, Windows Location (Settings → Privacy → Location, and allow desktop apps).
 
 **Start publishing** is enabled when you are signed in, the kit is connected, and the marker is confirmed.
 

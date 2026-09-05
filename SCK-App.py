@@ -14,11 +14,28 @@ import sys
 import threading
 import time
 import traceback
+from urllib.parse import unquote
+
+# Chromium flags must be set before QtWebEngine is imported.
+def _ensure_webengine_flags():
+    if sys.platform != "win32":
+        return
+    current = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+    if "CalculateNativeWinOcclusion" in current:
+        return
+    extra = "--disable-features=CalculateNativeWinOcclusion"
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (current + " " + extra).strip()
+
+
+_ensure_webengine_flags()
 
 # Keep a top-level PyQt6 import so PyInstaller always bundles Qt.
 import PyQt6  # noqa: F401
 from PyQt6.QtCore import (
+    QBuffer,
+    QByteArray,
     QCoreApplication,
+    QIODevice,
     QObject,
     QProcess,
     Qt,
@@ -41,6 +58,9 @@ from PyQt6.QtWebEngineCore import (
     QWebEngineProfile,
     QWebEngineSettings,
     QWebEngineUrlRequestInterceptor,
+    QWebEngineUrlRequestJob,
+    QWebEngineUrlScheme,
+    QWebEngineUrlSchemeHandler,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
@@ -134,7 +154,83 @@ def _prepare_frozen_workdir():
 
 APP_DIR = _bundle_dir()
 MAP_HTML = _data_path("sck_map.html")
+MAP_SCHEME = "sckmap"
+MAP_PAGE_HREF = MAP_SCHEME + "://bundle/sck_map.html"
 APP_ICON = _data_path("logo.png")
+_MAP_SCHEME_REGISTERED = False
+_MAP_MIME = {
+    ".css": b"text/css;charset=utf-8",
+    ".gif": b"image/gif",
+    ".htm": b"text/html;charset=utf-8",
+    ".html": b"text/html;charset=utf-8",
+    ".ico": b"image/x-icon",
+    ".jpeg": b"image/jpeg",
+    ".jpg": b"image/jpeg",
+    ".js": b"text/javascript;charset=utf-8",
+    ".json": b"application/json",
+    ".png": b"image/png",
+    ".svg": b"image/svg+xml",
+}
+
+
+def _register_map_scheme():
+    """Serve the Leaflet page over a secure custom origin instead of file://."""
+    global _MAP_SCHEME_REGISTERED
+    if _MAP_SCHEME_REGISTERED:
+        return
+    scheme = QWebEngineUrlScheme(MAP_SCHEME.encode("ascii"))
+    scheme.setSyntax(QWebEngineUrlScheme.Syntax.Host)
+    scheme.setFlags(
+        QWebEngineUrlScheme.Flag.SecureScheme
+        | QWebEngineUrlScheme.Flag.LocalAccessAllowed
+        | QWebEngineUrlScheme.Flag.CorsEnabled
+        | QWebEngineUrlScheme.Flag.ContentSecurityPolicyIgnored
+        | QWebEngineUrlScheme.Flag.FetchApiAllowed
+    )
+    QWebEngineUrlScheme.registerScheme(scheme)
+    _MAP_SCHEME_REGISTERED = True
+
+
+def _map_mime(path):
+    return _MAP_MIME.get(os.path.splitext(path)[1].lower(), b"application/octet-stream")
+
+
+class MapSchemeHandler(QWebEngineUrlSchemeHandler):
+    def __init__(self, root_dir, parent=None):
+        super().__init__(parent)
+        self._root = os.path.realpath(root_dir)
+
+    def requestStarted(self, job):
+        rel = unquote(job.requestUrl().path() or "").replace("\\", "/").lstrip("/")
+        if not rel or rel.endswith("/"):
+            rel = (rel + "sck_map.html") if rel else "sck_map.html"
+        if any(part == ".." for part in rel.split("/")):
+            job.fail(QWebEngineUrlRequestJob.Error.UrlInvalid)
+            return
+        full = os.path.realpath(os.path.join(self._root, *rel.split("/")))
+        try:
+            if os.path.commonpath([self._root, full]) != self._root:
+                job.fail(QWebEngineUrlRequestJob.Error.UrlInvalid)
+                return
+        except ValueError:
+            job.fail(QWebEngineUrlRequestJob.Error.UrlInvalid)
+            return
+        if not os.path.isfile(full):
+            print("map scheme 404:", rel)
+            job.fail(QWebEngineUrlRequestJob.Error.UrlNotFound)
+            return
+        try:
+            with open(full, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            job.fail(QWebEngineUrlRequestJob.Error.RequestFailed)
+            return
+        buf = QBuffer(job)
+        buf.setData(QByteArray(data))
+        buf.open(QIODevice.OpenModeFlag.ReadOnly)
+        job.reply(_map_mime(full), buf)
+
+
 APP_SUPPORT_DIR = _app_support_dir()
 _DATA_DIR = APP_SUPPORT_DIR if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 LOCATION_CACHE = os.path.join(_DATA_DIR, "sck_location.json")
@@ -214,6 +310,21 @@ def locate_helper_path():
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
     return None
+
+
+def _location_settings_help():
+    if sys.platform == "win32":
+        return (
+            "Could not get the computer location. In Windows Settings, turn on Location "
+            "and allow desktop apps to access it, then try Use my location again. "
+            "You can also click the map."
+        )
+    if sys.platform == "darwin":
+        return (
+            "Could not get the computer location. Allow STAplus SCK in System Settings → "
+            "Privacy & Security → Location Services if macOS asked."
+        )
+    return "Could not get the computer location. Click the map to place the marker."
 
 
 def list_serial_ports():
@@ -395,7 +506,7 @@ class MapPage(QWebEnginePage):
     def acceptNavigationRequest(self, url, nav_type, is_main_frame):
         if not is_main_frame:
             return True
-        return url.scheme().lower() in ("file", "qrc", "data", "about")
+        return url.scheme().lower() in ("file", "qrc", "data", "about", MAP_SCHEME)
 
 
 class LoginPage(QWebEnginePage):
@@ -613,6 +724,12 @@ class MainWindow(QMainWindow):
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
         self._grant_geolocation()
+        self._map_file_fallback = False
+        self._geo_source = None
+        self._map_scheme_handler = MapSchemeHandler(_bundle_dir(), self)
+        self.map_page.profile().installUrlSchemeHandler(
+            MAP_SCHEME.encode("ascii"), self._map_scheme_handler
+        )
         self.channel = QWebChannel(self.map_page)
         self.channel.registerObject("bridge", self.bridge)
         self.map_page.setWebChannel(self.channel)
@@ -641,7 +758,7 @@ class MainWindow(QMainWindow):
         self.bridge.markerMoved.connect(self.on_marker_moved)
         self.bridge.locationRequested.connect(self.request_os_location)
         self.map_view.loadFinished.connect(self._on_map_loaded)
-        self.map_view.load(QUrl.fromLocalFile(MAP_HTML))
+        self.map_view.load(QUrl(MAP_PAGE_HREF))
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(left)
@@ -721,8 +838,19 @@ class MainWindow(QMainWindow):
         granted = QWebEnginePage.PermissionPolicy.PermissionGrantedByUser
         self.map_page.setFeaturePermission(origin, feature, granted)
 
+    def _is_map_document(self, url):
+        scheme = url.scheme().lower()
+        return scheme == MAP_SCHEME or url.isLocalFile()
+
     def _on_map_loaded(self, ok):
-        if not ok or self._browser_mode != "map" or not self.map_view.url().isLocalFile():
+        url = self.map_view.url()
+        if not ok:
+            if not self._map_file_fallback and url.scheme().lower() == MAP_SCHEME:
+                self._map_file_fallback = True
+                print("sckmap load failed, falling back to file://")
+                self.map_view.load(QUrl.fromLocalFile(MAP_HTML))
+            return
+        if self._browser_mode != "map" or not self._is_map_document(url):
             return
         QTimer.singleShot(250, self._refit_map)
         if self.lat is not None and self.lon is not None:
@@ -906,14 +1034,14 @@ class MainWindow(QMainWindow):
 
     def _request_os_location(self, interactive=True):
         helper = locate_helper_path()
-        if not helper:
-            if interactive:
-                QMessageBox.warning(
-                    self,
-                    "Location",
-                    "The location helper is missing. Run ./vendor/sck-locate/build.sh and try again.",
-                )
+        if helper:
+            self._start_locate_helper(helper, interactive)
             return
+        if self._start_qt_location(interactive):
+            return
+        self._request_browser_geolocation(interactive)
+
+    def _start_locate_helper(self, helper, interactive):
         self._locate_interactive = interactive
         if self._locate_proc is not None:
             self._stop_locate_proc()
@@ -925,6 +1053,90 @@ class MainWindow(QMainWindow):
         proc.errorOccurred.connect(self._on_locate_process_error)
         self._locate_timeout.start(22000)
         proc.start(helper, [])
+
+    def _start_qt_location(self, interactive=True):
+        try:
+            from PyQt6.QtPositioning import QGeoPositionInfoSource
+        except ImportError:
+            return False
+        if self._geo_source is None:
+            self._geo_source = QGeoPositionInfoSource.createDefaultSource(self)
+            if self._geo_source is None:
+                return False
+            self._geo_source.positionUpdated.connect(self._on_qt_position)
+            if hasattr(self._geo_source, "errorOccurred"):
+                self._geo_source.errorOccurred.connect(self._on_qt_position_error)
+        self._locate_interactive = interactive
+        self.statusBar().showMessage("Finding current location…")
+        self._locate_timeout.start(22000)
+        try:
+            self._geo_source.requestUpdate(20000)
+        except Exception:
+            self._locate_timeout.stop()
+            return False
+        return True
+
+    def _on_qt_position(self, info):
+        self._locate_timeout.stop()
+        try:
+            coord = info.coordinate()
+        except Exception:
+            coord = None
+        if coord is None or not coord.isValid():
+            self._on_location_unavailable()
+            return
+        self._apply_computer_location(coord.latitude(), coord.longitude())
+
+    def _on_qt_position_error(self, error):
+        try:
+            from PyQt6.QtPositioning import QGeoPositionInfoSource
+            access = QGeoPositionInfoSource.Error.AccessError
+        except Exception:
+            access = None
+        if access is not None and error == access:
+            self._locate_timeout.stop()
+            self._on_location_denied()
+            return
+        # Timeout and other errors fall through to _on_locate_timeout if still pending.
+
+    def _request_browser_geolocation(self, interactive=True):
+        self._locate_interactive = interactive
+        self.statusBar().showMessage("Finding current location…")
+        self._locate_timeout.start(20000)
+        self.map_view.page().runJavaScript(
+            """
+            (function () {
+              if (!navigator.geolocation) return "unsupported";
+              navigator.geolocation.getCurrentPosition(
+                function (pos) {
+                  window.sckBoot && window.sckBoot(pos.coords.latitude, pos.coords.longitude);
+                },
+                function (err) {
+                  console.log("geolocation error " + err.code + " " + err.message);
+                },
+                { enableHighAccuracy: true, timeout: 18000, maximumAge: 60000 }
+              );
+              return "ok";
+            })();
+            """,
+            0,
+            self._on_browser_geo_started,
+        )
+
+    def _on_browser_geo_started(self, result):
+        if result == "unsupported":
+            self._locate_timeout.stop()
+            self._on_location_unavailable()
+
+    def _on_location_denied(self):
+        self.statusBar().showMessage("Location permission denied. Click the map or “Use my location”.")
+        if self._locate_interactive:
+            QMessageBox.warning(self, "Location", _location_settings_help())
+
+    def _on_location_unavailable(self):
+        self.statusBar().showMessage("Could not get the current location. Click the map or “Use my location”.")
+        if self._locate_interactive:
+            QMessageBox.warning(self, "Location", _location_settings_help())
 
     def _stop_locate_proc(self):
         proc = self._locate_proc
@@ -946,13 +1158,12 @@ class MainWindow(QMainWindow):
 
     def _on_locate_timeout(self):
         self._stop_locate_proc()
-        self.statusBar().showMessage("Could not get the current location. Click the map or “Use my location”.")
-        if self._locate_interactive:
-            QMessageBox.warning(
-                self,
-                "Location",
-                "Could not get the computer location in time. Check Location Services for STAplus SCK.",
-            )
+        if self._geo_source is not None:
+            try:
+                self._geo_source.stopUpdates()
+            except Exception:
+                pass
+        self._on_location_unavailable()
 
     def _on_locate_process_error(self, error):
         if error == QProcess.ProcessError.Crashed:
@@ -991,23 +1202,12 @@ class MainWindow(QMainWindow):
                 self._apply_computer_location(lat, lon)
                 return
         if code == 2 or "permission denied" in output.lower():
-            self.statusBar().showMessage("Location permission denied. Click the map or “Use my location”.")
-            if self._locate_interactive:
-                QMessageBox.warning(
-                    self,
-                    "Location",
-                    "Location permission was denied. Enable it in System Settings → Privacy & Security → Location Services for STAplus SCK.",
-                )
+            self._on_location_denied()
             return
-        self.statusBar().showMessage("Could not get the current location. Click the map or “Use my location”.")
-        if self._locate_interactive:
-            QMessageBox.warning(
-                self,
-                "Location",
-                "Could not get the computer location. Allow STAplus SCK in Location Services if macOS asked.",
-            )
+        self._on_location_unavailable()
 
     def _apply_computer_location(self, lat, lon):
+        self._locate_timeout.stop()
         self._set_coords(lat, lon, confirmed=False)
         self.map_view.page().runJavaScript(
             "window.sckBoot && window.sckBoot(%s, %s);" % (self.lat, self.lon)
@@ -1017,6 +1217,8 @@ class MainWindow(QMainWindow):
         )
 
     def on_marker_moved(self, lat, lon):
+        if self._locate_timeout.isActive():
+            self._locate_timeout.stop()
         self._set_coords(lat, lon, confirmed=False)
 
     def confirm_location(self):
@@ -1316,6 +1518,7 @@ class MainWindow(QMainWindow):
 
 def main():
     _prepare_frozen_workdir()
+    _register_map_scheme()
     app = QApplication(sys.argv)
     if os.path.isfile(APP_ICON):
         app.setWindowIcon(QIcon(APP_ICON))

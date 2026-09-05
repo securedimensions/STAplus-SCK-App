@@ -21,12 +21,12 @@
     }
     .sck-popup .leaflet-popup-content {
       margin: 8px 10px 10px;
-      min-width: 300px;
+      min-width: 340px;
     }
     .sck-charts {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 8px 12px;
+      gap: 10px 14px;
       font: 11px/1.2 system-ui, sans-serif;
       color: #222;
     }
@@ -37,10 +37,44 @@
       font-weight: 600;
     }
     .sck-chart-head .val { font-variant-numeric: tabular-nums; font-weight: 500; }
-    .sck-chart canvas {
+    .sck-chart-plot {
+      display: grid;
+      grid-template-columns: 2.6em 1fr;
+      grid-template-rows: auto auto;
+      column-gap: 4px;
+      align-items: stretch;
+    }
+    .sck-y {
+      grid-column: 1;
+      grid-row: 1;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      color: #555;
+      font-size: 9px;
+      line-height: 1;
+      padding: 1px 0;
+    }
+    .sck-chart-plot canvas {
+      grid-column: 2;
+      grid-row: 1;
       display: block;
       width: 100%;
-      height: 42px;
+      height: 48px;
+    }
+    .sck-x {
+      grid-column: 2;
+      grid-row: 2;
+      display: flex;
+      justify-content: space-between;
+      gap: 6px;
+      font-variant-numeric: tabular-nums;
+      color: #555;
+      font-size: 9px;
+      line-height: 1.2;
+      margin-top: 2px;
     }
     .sck-charts-caption {
       grid-column: 1 / -1;
@@ -131,7 +165,11 @@
       SERIES.forEach(function (s) {
         html += '<div class="sck-chart" data-key="' + s.key + '">';
         html += '<div class="sck-chart-head"><span>' + s.label + '</span><span class="val">—</span></div>';
-        html += '<canvas></canvas></div>';
+        html += '<div class="sck-chart-plot">';
+        html += '<div class="sck-y"><span class="sck-ymax">—</span><span class="sck-ymin">—</span></div>';
+        html += '<canvas></canvas>';
+        html += '<div class="sck-x"><span class="sck-tmin">—</span><span class="sck-tmax">—</span></div>';
+        html += '</div></div>';
       });
       html += "</div>";
       return html;
@@ -141,8 +179,8 @@
       if (!marker || !kitConnected) return;
       if (marker.getPopup()) return;
       marker.bindPopup(chartPopupHtml(), {
-        maxWidth: 380,
-        minWidth: 300,
+        maxWidth: 420,
+        minWidth: 340,
         className: "sck-popup",
         autoPan: true,
         autoClose: false,
@@ -192,32 +230,65 @@
       }
     }
 
-    function drawSpark(canvas, rows, key, color) {
+    function formatAxisNum(v) {
+      if (!Number.isFinite(v)) return "—";
+      const a = Math.abs(v);
+      if (a >= 1000) return v.toFixed(0);
+      if (a >= 100) return v.toFixed(1);
+      return v.toFixed(2);
+    }
+
+    function formatAxisTime(ts) {
+      if (ts == null || !Number.isFinite(Number(ts))) return "time";
+      const d = new Date(Number(ts) * 1000);
+      if (Number.isNaN(d.getTime())) return "time";
+      return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    }
+
+    function seriesPoints(rows, key) {
+      const pts = [];
+      (rows || []).forEach(function (row) {
+        const v = Number(row[key]);
+        const t = rowTime(row);
+        if (Number.isFinite(v) && t != null) pts.push({ t: t, v: v });
+      });
+      return pts;
+    }
+
+    function drawSpark(canvas, pts, color) {
       const dpr = window.devicePixelRatio || 1;
       const cssW = canvas.clientWidth || 140;
-      const cssH = canvas.clientHeight || 42;
+      const cssH = canvas.clientHeight || 48;
       canvas.width = Math.max(1, Math.round(cssW * dpr));
       canvas.height = Math.max(1, Math.round(cssH * dpr));
       const ctx = canvas.getContext("2d");
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, cssW, cssH);
-      const vals = [];
-      (rows || []).forEach(function (row) {
-        const v = Number(row[key]);
-        if (Number.isFinite(v)) vals.push(v);
-      });
-      if (!vals.length) return;
+      if (!pts.length) return;
+      const vals = pts.map(function (p) { return p.v; });
       const min = Math.min.apply(null, vals);
       const max = Math.max.apply(null, vals);
       const span = max - min || 1;
-      const n = vals.length;
-      const pad = 2;
-      const innerW = cssW - pad * 2;
-      const innerH = cssH - pad * 2;
+      const t0 = pts[0].t;
+      const t1 = pts[pts.length - 1].t;
+      const tspan = t1 - t0 || 1;
+      const padL = 1;
+      const padR = 3;
+      const padT = 3;
+      const padB = 3;
+      const innerW = cssW - padL - padR;
+      const innerH = cssH - padT - padB;
+      ctx.strokeStyle = "rgba(0,0,0,0.12)";
+      ctx.lineWidth = 1;
       ctx.beginPath();
-      vals.forEach(function (v, i) {
-        const x = n === 1 ? pad : pad + (i / (n - 1)) * innerW;
-        const y = cssH - pad - ((v - min) / span) * innerH;
+      ctx.moveTo(padL, padT);
+      ctx.lineTo(padL, cssH - padB);
+      ctx.lineTo(cssW - padR, cssH - padB);
+      ctx.stroke();
+      ctx.beginPath();
+      pts.forEach(function (p, i) {
+        const x = pts.length === 1 ? padL : padL + ((p.t - t0) / tspan) * innerW;
+        const y = cssH - padB - ((p.v - min) / span) * innerH;
         if (i === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
       });
@@ -225,8 +296,9 @@
       ctx.lineWidth = 1.6;
       ctx.lineJoin = "round";
       ctx.stroke();
-      const lastX = n === 1 ? pad : pad + innerW;
-      const lastY = cssH - pad - ((vals[n - 1] - min) / span) * innerH;
+      const last = pts[pts.length - 1];
+      const lastX = pts.length === 1 ? padL : padL + ((last.t - t0) / tspan) * innerW;
+      const lastY = cssH - padB - ((last.v - min) / span) * innerH;
       ctx.beginPath();
       ctx.arc(lastX, lastY, 2.2, 0, Math.PI * 2);
       ctx.fillStyle = color;
@@ -249,17 +321,31 @@
       SERIES.forEach(function (s) {
         const box = el.querySelector('.sck-chart[data-key="' + s.key + '"]');
         if (!box) return;
-        const values = [];
-        chartData.forEach(function (row) {
-          const n = Number(row[s.key]);
-          if (Number.isFinite(n)) values.push(n);
-        });
+        const pts = seriesPoints(chartData, s.key);
         const valEl = box.querySelector(".val");
         if (valEl) {
-          valEl.textContent = values.length ? values[values.length - 1].toFixed(2) : "—";
+          valEl.textContent = pts.length ? pts[pts.length - 1].v.toFixed(2) : "—";
+        }
+        const ymax = box.querySelector(".sck-ymax");
+        const ymin = box.querySelector(".sck-ymin");
+        const tmin = box.querySelector(".sck-tmin");
+        const tmax = box.querySelector(".sck-tmax");
+        if (pts.length) {
+          const vals = pts.map(function (p) { return p.v; });
+          const lo = Math.min.apply(null, vals);
+          const hi = Math.max.apply(null, vals);
+          if (ymax) ymax.textContent = formatAxisNum(hi);
+          if (ymin) ymin.textContent = formatAxisNum(lo);
+          if (tmin) tmin.textContent = formatAxisTime(pts[0].t);
+          if (tmax) tmax.textContent = formatAxisTime(pts[pts.length - 1].t);
+        } else {
+          if (ymax) ymax.textContent = "—";
+          if (ymin) ymin.textContent = "—";
+          if (tmin) tmin.textContent = "—";
+          if (tmax) tmax.textContent = "—";
         }
         const canvas = box.querySelector("canvas");
-        if (canvas) drawSpark(canvas, chartData, s.key, s.color);
+        if (canvas) drawSpark(canvas, pts, s.color);
       });
     }
 
@@ -271,7 +357,8 @@
         const incoming = points[points.length - 1];
         const copy = {};
         Object.keys(incoming).forEach(function (k) { copy[k] = incoming[k]; });
-        copy.ts = Date.now() / 1000;
+        const incomingTs = Number(incoming.ts != null ? incoming.ts : incoming._ts);
+        copy.ts = Number.isFinite(incomingTs) ? incomingTs : Date.now() / 1000;
         copy._ts = copy.ts;
         chartData.push(copy);
         trimChartData();
@@ -292,6 +379,9 @@
       if (typeof L === "undefined") {
         if (attempt < 40) {
           setTimeout(function () { initMap(attempt + 1); }, 50);
+        } else {
+          var hint = document.querySelector(".hint");
+          if (hint) hint.textContent = "Map library failed to load.";
         }
         return;
       }
@@ -308,11 +398,6 @@
       map.on("click", function (e) {
         setMarker(e.latlng.lat, e.latlng.lng, false);
       });
-      document.getElementById("locate").onclick = function () {
-        if (bridge && bridge.requestLocation) {
-          bridge.requestLocation();
-        }
-      };
       setTimeout(function () { map.invalidateSize(); }, 200);
     }
 
@@ -325,14 +410,31 @@
       }
     };
 
+    function locateWithBrowser() {
+      if (!navigator.geolocation) return false;
+      navigator.geolocation.getCurrentPosition(function (pos) {
+        setMarker(pos.coords.latitude, pos.coords.longitude, true);
+      }, function (err) {
+        console.log("geolocation error " + err.code + " " + err.message);
+      }, { enableHighAccuracy: true, timeout: 18000, maximumAge: 60000 });
+      return true;
+    }
+
+    function onLocate() {
+      if (bridge && bridge.requestLocation) {
+        bridge.requestLocation();
+        return;
+      }
+      locateWithBrowser();
+    }
+
     function start() {
+      document.getElementById("locate").onclick = onLocate;
+      initMap();
       if (typeof qt !== "undefined" && qt.webChannelTransport && typeof QWebChannel === "function") {
         new QWebChannel(qt.webChannelTransport, function (channel) {
           bridge = channel.objects.bridge;
-          initMap();
         });
-      } else {
-        initMap();
       }
     }
 

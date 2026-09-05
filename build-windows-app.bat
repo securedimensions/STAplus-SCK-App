@@ -20,4 +20,12 @@ if not exist "dist\STAplus SCK\_internal\uuid.py" (
   echo Bundle is missing uuid.py
   exit /b 1
 )
+if not exist "dist\STAplus SCK\_internal\sck_map.html" (
+  echo Bundle is missing sck_map.html
+  exit /b 1
+)
+if not exist "dist\STAplus SCK\_internal\vendor\leaflet\leaflet.js" (
+  echo Bundle is missing vendor\leaflet\leaflet.js
+  exit /b 1
+)
 echo Built: %CD%\dist\STAplus SCK\STAplus SCK.exe

@@ -25,6 +25,7 @@ hiddenimports = [
     "PyQt6.QtWebEngineWidgets",
     "PyQt6.QtWebEngineCore",
     "PyQt6.QtWebChannel",
+    "PyQt6.QtPositioning",
     "uuid",
     "_uuid",
     "copy",
@@ -91,6 +92,7 @@ for pkg in (
     "serial",
     "paho",
     "cryptography",
+    "PyQt6.QtPositioning",
 ):
     try:
         extra_datas, extra_binaries, extra_hidden = collect_all(pkg)
