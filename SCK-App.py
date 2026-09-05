@@ -145,12 +145,9 @@ def _prepare_frozen_workdir():
     support = _app_support_dir()
     os.makedirs(support, exist_ok=True)
     dest = os.path.join(support, "SensorApp.json")
-    if not _oauth_json_usable(dest):
-        for name in ("SensorApp.json_", "SensorApp.json"):
-            bundled = os.path.join(_bundle_dir(), name)
-            if os.path.isfile(bundled) and _oauth_json_usable(bundled):
-                shutil.copy2(bundled, dest)
-                break
+    bundled = os.path.join(_bundle_dir(), "SensorApp.json")
+    if os.path.isfile(bundled) and (not os.path.isfile(dest) or not _oauth_json_usable(dest)):
+        shutil.copy2(bundled, dest)
     os.chdir(support)
 
 
@@ -494,7 +491,6 @@ class SetupWorker(QThread):
 
     def run(self):
         try:
-            sckapp.assert_sta_access_token(self.access_token)
             service = sckapp.sta_service(self.access_token)
             config = sckapp.setup(service, self.user, self.location)
             party = service.parties().find(self.user["sub"])
@@ -1531,14 +1527,15 @@ class MainWindow(QMainWindow):
             try:
                 self.access_token, self.refresh_token = sckapp.updateTokens(self.refresh_token)
             except Exception as err:
-                QMessageBox.warning(
-                    self,
-                    "Sign-in expired",
-                    "Could not refresh the AUTHENIX token. Sign in again, then retry Start publishing.\n\n%s"
-                    % err,
-                )
-                self.start_btn.setEnabled(True)
-                return
+                if not sckapp.access_token_usable(self.access_token):
+                    QMessageBox.warning(
+                        self,
+                        "Sign-in expired",
+                        "Could not refresh the AUTHENIX token. Sign in again, then retry Start publishing.\n\n%s"
+                        % err,
+                    )
+                    self.start_btn.setEnabled(True)
+                    return
         loc = staPlus.Location(
             name=name,
             description="Location chosen in the SCK desktop app",

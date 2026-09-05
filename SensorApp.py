@@ -59,16 +59,14 @@ OAUTH_SCOPES = [
     "citiobs.secd.eu#create",
     "citiobs.secd.eu#update",
 ]
-# STAplus demo API audience registered with AUTHENIX.
+# STAplus demo API audience registered with AUTHENIX (client registration only).
 STA_AUDIENCE = "3042e50b-dc09-4817-b34c-1b06c709da78"
 AUTHENIX_ORIGIN = "https://authenix.eu"
 AUTHENIX_AUTHORIZE = AUTHENIX_ORIGIN + "/oauth/authorize"
 AUTHENIX_TOKEN = AUTHENIX_ORIGIN + "/oauth/token"
-AUTHENIX_TOKENINFO = "https://www.authenix.eu/oauth/tokeninfo"
 AUTHENIX_JWKS = AUTHENIX_ORIGIN + "/.well-known/jwks.json"
 AUTHENIX_REGISTER = AUTHENIX_ORIGIN + "/oauth/register"
 AUTHENIX_LOGOUT = AUTHENIX_ORIGIN + "/openid/logout"
-_STA_SAFE_METHODS = {"get", "head", "options"}
 OAUTH_REDIRECT_URI = "http://127.0.0.1:4711/SensorApp"
 OAUTH_LOGOUT_REDIRECT_URI = "http://127.0.0.1:4711/SensorApp/logout"
 AUTHENIX_REGISTER_LOGO_URI = (
@@ -194,28 +192,13 @@ def _as_string_list(value):
     return []
 
 
-def _client_unexpired(meta):
-    expires = meta.get("expires") if isinstance(meta, dict) else None
-    if expires is None:
-        return True
-    try:
-        return int(time.time()) < int(expires)
-    except (TypeError, ValueError):
-        return False
-
-
 def _valid_client_metadata(meta):
     if not isinstance(meta, dict) or "error" in meta or not meta.get("client_id"):
         return False
     if not meta.get("client_secret"):
         return False
-    if not _client_unexpired(meta):
-        return False
     grants = _as_string_list(meta.get("grant_types"))
-    if "authorization_code" not in grants:
-        return False
-    audiences = _as_string_list(meta.get("audiences"))
-    return STA_AUDIENCE in audiences
+    return "authorization_code" in grants
 
 
 def _oauth_form_post(url, form, client_id, client_secret=""):
@@ -310,13 +293,24 @@ def _register_web_client():
 def registerApp() -> Tuple[str, str]:
     dest = os.path.join(os.getcwd(), "SensorApp.json")
     app_metadata, loaded_from = _load_sensor_app_json()
-    if not _valid_client_metadata(app_metadata):
+    register = not _valid_client_metadata(app_metadata)
+    if _valid_client_metadata(app_metadata):
+        expires = app_metadata.get("expires")
+        if expires is not None:
+            try:
+                if int(time.time()) >= int(expires):
+                    register = True
+            except (TypeError, ValueError):
+                pass
+
+    if register:
         app_metadata = _register_web_client()
         with open(dest, "w", encoding="utf-8") as handle:
             json.dump(app_metadata, handle)
     elif loaded_from and os.path.abspath(loaded_from) != os.path.abspath(dest):
-        with open(dest, "w", encoding="utf-8") as handle:
-            json.dump(app_metadata, handle)
+        if os.path.basename(loaded_from) != "SensorApp.json_":
+            with open(dest, "w", encoding="utf-8") as handle:
+                json.dump(app_metadata, handle)
 
     client_id = app_metadata["client_id"]
     client_secret = app_metadata.get("client_secret") or ""
@@ -331,7 +325,6 @@ def updateTokens(refresh_token):
         {
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
-            "audience": STA_AUDIENCE,
         },
         client_id,
         client_secret,
@@ -407,7 +400,6 @@ def start_authorization():
             "response_type": "code",
             "response_mode": "query",
             "scope": " ".join(OAUTH_SCOPES),
-            "audience": STA_AUDIENCE,
             "state": state,
             "nonce": nonce,
             "code_challenge": challenge,
@@ -443,7 +435,6 @@ def finish_authorization(started, redirect_url):
             "code": code,
             "redirect_uri": OAUTH_REDIRECT_URI,
             "code_verifier": started["code_verifier"],
-            "audience": STA_AUDIENCE,
         },
         started["client_id"],
         started["client_secret"],
@@ -459,7 +450,6 @@ def finish_authorization(started, redirect_url):
     if not id_token:
         raise RuntimeError("Token response did not include an id_token.")
     user = _id_token_claims(id_token, started["client_id"])
-    _logger.info("access token: %s", _format_access_token_debug(body["access_token"]))
     return body["access_token"], body.get("refresh_token") or "", user, id_token
 
 
@@ -819,6 +809,20 @@ def _normalize_bearer_token(token):
     return text
 
 
+def access_token_usable(token, skew=30):
+    text = _normalize_bearer_token(token)
+    if not text:
+        return False
+    claims = _access_token_claims(text)
+    exp = claims.get("exp")
+    if exp is None:
+        return True
+    try:
+        return int(exp) > int(time.time()) + int(skew)
+    except (TypeError, ValueError):
+        return True
+
+
 def _access_token_claims(token):
     text = _normalize_bearer_token(token)
     if not text:
@@ -855,51 +859,6 @@ def _format_access_token_debug(token):
     if aud is not None and STA_AUDIENCE not in auds and aud != STA_AUDIENCE:
         bits.append("not issued for the STAplus API")
     return "; ".join(bits)
-
-
-def _introspect_access_token(token):
-    """Ask AUTHENIX whether this token is active, using the app's client."""
-    text = _normalize_bearer_token(token)
-    if not text:
-        return {}
-    try:
-        client_id, client_secret = registerApp()
-        response = requests.post(
-            AUTHENIX_TOKENINFO,
-            data={"token": text, "token_type_hint": "access_token"},
-            headers={"Accept": "application/json"},
-            auth=HTTPBasicAuth(client_id, client_secret) if client_secret else None,
-            timeout=15,
-        )
-        body = response.json()
-        return body if isinstance(body, dict) else {}
-    except Exception:
-        return {}
-
-
-def assert_sta_access_token(access_token):
-    """Fail early when AUTHENIX will not treat this token as active for STAplus."""
-    token = _normalize_bearer_token(access_token)
-    if not token:
-        raise RuntimeError("Sign in again, then retry Start publishing.")
-    info = _introspect_access_token(token)
-    claims = _access_token_claims(token)
-    debug = _format_access_token_debug(token)
-    if info.get("active") is False:
-        raise RuntimeError(
-            "AUTHENIX reports the access token is not active.\n\n%s\n\n"
-            "Sign out, sign in again, then retry Start publishing."
-            % debug
-        )
-    aud = claims.get("aud")
-    auds = _as_string_list(aud)
-    if aud is not None and STA_AUDIENCE not in auds and aud != STA_AUDIENCE:
-        raise RuntimeError(
-            "The access token is not issued for the STAplus API.\n\n%s\n\n"
-            "Sign out, sign in again, then retry Start publishing."
-            % debug
-        )
-    return info
 
 
 def _format_sta_http_error(exc, href="", token=""):
@@ -954,27 +913,18 @@ def format_setup_error(err):
 
 
 def attach_sta_http_errors(service):
-    """Send Bearer only on writes. Anonymous GET is allowed; an inactive token 401s it."""
+    """Turn empty/non-JSON HTTP error bodies into a readable RuntimeError."""
+    original = service.execute
 
     def execute(method, url, **kwargs):
         href = url if isinstance(url, str) else str(url)
         kwargs.setdefault("timeout", 60)
-        headers = dict(kwargs.get("headers") or {})
         token = ""
         handler = getattr(service, "auth_handler", None)
         if handler is not None:
             token = _normalize_bearer_token(getattr(handler, "token", ""))
-        method_l = str(method).lower()
-        if token and method_l not in _STA_SAFE_METHODS:
-            headers["Authorization"] = "Bearer " + token
-        kwargs["headers"] = headers
-        kwargs.pop("auth", None)
         try:
-            response = requests.request(
-                method, href, proxies=getattr(service, "proxies", None), **kwargs
-            )
-            response.raise_for_status()
-            return response
+            return original(method, href, **kwargs)
         except requests.exceptions.HTTPError as exc:
             raise RuntimeError(_format_sta_http_error(exc, href, token)) from exc
 
