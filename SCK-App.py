@@ -89,9 +89,7 @@ from PyQt6.QtWidgets import (
 from geojson import Point
 from serial import Serial
 from serial.tools import list_ports
-from staplus_client.service import auth_handler
 import staplus_client as staPlus
-import sta_dggs_client as dggs
 
 import SensorApp as sckapp
 
@@ -493,13 +491,12 @@ class SetupWorker(QThread):
 
     def run(self):
         try:
-            auth = auth_handler.AuthHandler(self.access_token)
-            service = dggs.compose(sckapp.url, auth_handler=auth)
+            service = sckapp.sta_service(self.access_token)
             config = sckapp.setup(service, self.user, self.location)
             party = service.parties().find(self.user["sub"])
             self.succeeded.emit(service, config, party)
-        except Exception:
-            self.failed.emit(traceback.format_exc())
+        except Exception as err:
+            self.failed.emit(sckapp.format_setup_error(err))
 
 
 class SerialWorker(QThread):
@@ -1614,6 +1611,7 @@ class MainWindow(QMainWindow):
 
 def main():
     _prepare_frozen_workdir()
+    sckapp.configure_ssl_certs()
     _register_map_scheme()
     app = QApplication(sys.argv)
     if os.path.isfile(APP_ICON):

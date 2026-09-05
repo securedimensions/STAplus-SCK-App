@@ -18,6 +18,7 @@ import json
 import os
 import random
 import time
+import traceback
 import string
 import requests
 import math
@@ -775,8 +776,91 @@ def publish(service, client, config, party, sck, loc=None):
 
         time.sleep(SCK_SAMPLE_INTERVAL)
 
+def configure_ssl_certs():
+    """Point requests/OpenSSL at a CA bundle (needed in the frozen Windows exe)."""
+    try:
+        import certifi
+    except ImportError:
+        return
+    path = certifi.where()
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", "")
+        bundled = os.path.join(meipass or os.path.dirname(sys.executable), "cacert.pem")
+        if os.path.isfile(bundled):
+            path = bundled
+    if os.path.isfile(path):
+        os.environ.setdefault("SSL_CERT_FILE", path)
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", path)
+
+
 def _odata_quote(value):
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _format_sta_http_error(exc, href=""):
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    body = ""
+    if response is not None:
+        text = (response.text or "").strip()
+        try:
+            data = response.json()
+            if isinstance(data, dict):
+                body = str(
+                    data.get("message") or data.get("error") or data.get("detail") or text
+                )
+            else:
+                body = text
+        except Exception:
+            body = text
+    parts = ["STAplus request failed"]
+    if status:
+        parts.append("(HTTP %s)" % status)
+    if href:
+        parts.append("for %s" % href)
+    msg = " ".join(parts) + "."
+    if body:
+        msg += "\n\n" + body[:1500]
+    else:
+        msg += "\n\nThe server returned an empty error body."
+    if status in (401, 403):
+        msg += "\n\nSign in again, then retry Start publishing."
+    return msg
+
+
+def format_setup_error(err):
+    """User-facing text for setup failures; keep HTTP status when the client hid it."""
+    if isinstance(err, RuntimeError) and str(err).startswith("STAplus request failed"):
+        return str(err)
+    http = err if isinstance(err, requests.exceptions.HTTPError) else getattr(err, "__context__", None)
+    if isinstance(http, requests.exceptions.HTTPError):
+        href = ""
+        if http.response is not None:
+            href = http.response.url or ""
+        return _format_sta_http_error(http, href)
+    return "".join(traceback.format_exception(type(err), err, err.__traceback__))
+
+
+def attach_sta_http_errors(service):
+    """Turn empty/non-JSON HTTP error bodies into a readable RuntimeError."""
+    original = service.execute
+
+    def execute(method, url, **kwargs):
+        href = url if isinstance(url, str) else str(url)
+        kwargs.setdefault("timeout", 60)
+        try:
+            return original(method, href, **kwargs)
+        except requests.exceptions.HTTPError as exc:
+            raise RuntimeError(_format_sta_http_error(exc, href)) from exc
+
+    service.execute = execute
+    return service
+
+
+def sta_service(access_token):
+    auth = auth_handler.AuthHandler(access_token)
+    return attach_sta_http_errors(dggs.compose(url, auth_handler=auth))
+
 
 def _reuse_or_create_base_observed_property(service, observed_property, by_definition, by_name):
     existing = None
@@ -810,7 +894,10 @@ def _reuse_or_create_sensor(service, sensor):
 
 def setup(service, user, location):
 
-    parties = service.parties().query().filter("authId eq '" + user['sub'] + "'")
+    sub = user.get("sub") if isinstance(user, dict) else None
+    if not sub:
+        raise RuntimeError("Sign-in did not return a user id. Sign in again, then retry Start publishing.")
+    parties = service.parties().query().filter("authId eq " + _odata_quote(sub))
     if (len(parties.list().entities) == 0):
         preferred_username = user.get('preferred_username') if 'preferred_username' in user.keys() else ''
         ljs = staPlus.Party(description='', display_name=preferred_username, role='individual')
@@ -819,7 +906,7 @@ def setup(service, user, location):
         ljs = parties.list().entities[0]
         ljs_id = ljs.auth_id
 
-    result = service.parties().query().filter("authId eq '" + ljs_id + "'").expand('Things').list()
+    result = service.parties().query().filter("authId eq " + _odata_quote(ljs_id)).expand('Things').list()
     thing_found = False
     raspi = None
     if result.entities[0].things.entities:
@@ -1029,9 +1116,9 @@ def on_publish(client, userdata, mid, reason_code, properties):
     print("mid: " + str(mid))
 
 if __name__ == "__main__":
+    configure_ssl_certs()
     access_token, refresh_token, user = authorize()
-    auth = auth_handler.AuthHandler(access_token)
-    service = dggs.compose(url, auth_handler=auth)
+    service = sta_service(access_token)
     _logger.debug("processing with access token: " + access_token)
     config = setup(service, user, location)
     party = service.parties().find(user['sub'])

@@ -20,6 +20,11 @@ _locate_app = os.path.join("vendor", "sck-locate", "sck-locate.app")
 if sys.platform == "darwin" and os.path.isdir(_locate_app):
     datas.append((_locate_app, "sck-locate.app"))
 datas += collect_data_files("orderedmultidict", include_py_files=True)
+try:
+    import certifi
+    datas.append((certifi.where(), "."))
+except Exception:
+    pass
 binaries = []
 hiddenimports = [
     "PyQt6.QtWebEngineWidgets",
@@ -70,6 +75,7 @@ hiddenimports = [
     "h3",
     "jwt",
     "requests",
+    "certifi",
     "serial",
     "paho",
     "paho.mqtt",
