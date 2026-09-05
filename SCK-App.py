@@ -145,14 +145,12 @@ def _prepare_frozen_workdir():
     support = _app_support_dir()
     os.makedirs(support, exist_ok=True)
     dest = os.path.join(support, "SensorApp.json")
-    preferred = None
-    for name in ("SensorApp.json_", "SensorApp.json"):
-        bundled = os.path.join(_bundle_dir(), name)
-        if os.path.isfile(bundled) and _oauth_json_usable(bundled):
-            preferred = bundled
-            break
-    if preferred:
-        shutil.copy2(preferred, dest)
+    if not _oauth_json_usable(dest):
+        for name in ("SensorApp.json_", "SensorApp.json"):
+            bundled = os.path.join(_bundle_dir(), name)
+            if os.path.isfile(bundled) and _oauth_json_usable(bundled):
+                shutil.copy2(bundled, dest)
+                break
     os.chdir(support)
 
 
@@ -496,6 +494,7 @@ class SetupWorker(QThread):
 
     def run(self):
         try:
+            sckapp.assert_sta_access_token(self.access_token)
             service = sckapp.sta_service(self.access_token)
             config = sckapp.setup(service, self.user, self.location)
             party = service.parties().find(self.user["sub"])

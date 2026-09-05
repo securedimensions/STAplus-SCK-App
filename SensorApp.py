@@ -64,9 +64,11 @@ STA_AUDIENCE = "3042e50b-dc09-4817-b34c-1b06c709da78"
 AUTHENIX_ORIGIN = "https://authenix.eu"
 AUTHENIX_AUTHORIZE = AUTHENIX_ORIGIN + "/oauth/authorize"
 AUTHENIX_TOKEN = AUTHENIX_ORIGIN + "/oauth/token"
+AUTHENIX_TOKENINFO = "https://www.authenix.eu/oauth/tokeninfo"
 AUTHENIX_JWKS = AUTHENIX_ORIGIN + "/.well-known/jwks.json"
 AUTHENIX_REGISTER = AUTHENIX_ORIGIN + "/oauth/register"
 AUTHENIX_LOGOUT = AUTHENIX_ORIGIN + "/openid/logout"
+_STA_SAFE_METHODS = {"get", "head", "options"}
 OAUTH_REDIRECT_URI = "http://127.0.0.1:4711/SensorApp"
 OAUTH_LOGOUT_REDIRECT_URI = "http://127.0.0.1:4711/SensorApp/logout"
 AUTHENIX_REGISTER_LOGO_URI = (
@@ -192,10 +194,22 @@ def _as_string_list(value):
     return []
 
 
+def _client_unexpired(meta):
+    expires = meta.get("expires") if isinstance(meta, dict) else None
+    if expires is None:
+        return True
+    try:
+        return int(time.time()) < int(expires)
+    except (TypeError, ValueError):
+        return False
+
+
 def _valid_client_metadata(meta):
     if not isinstance(meta, dict) or "error" in meta or not meta.get("client_id"):
         return False
     if not meta.get("client_secret"):
+        return False
+    if not _client_unexpired(meta):
         return False
     grants = _as_string_list(meta.get("grant_types"))
     if "authorization_code" not in grants:
@@ -296,24 +310,13 @@ def _register_web_client():
 def registerApp() -> Tuple[str, str]:
     dest = os.path.join(os.getcwd(), "SensorApp.json")
     app_metadata, loaded_from = _load_sensor_app_json()
-    register = not _valid_client_metadata(app_metadata)
-    if _valid_client_metadata(app_metadata):
-        expires = app_metadata.get("expires")
-        if expires is not None:
-            try:
-                if int(time.time()) >= int(expires):
-                    register = True
-            except (TypeError, ValueError):
-                pass
-
-    if register:
+    if not _valid_client_metadata(app_metadata):
         app_metadata = _register_web_client()
         with open(dest, "w", encoding="utf-8") as handle:
             json.dump(app_metadata, handle)
     elif loaded_from and os.path.abspath(loaded_from) != os.path.abspath(dest):
-        if os.path.basename(loaded_from) != "SensorApp.json_":
-            with open(dest, "w", encoding="utf-8") as handle:
-                json.dump(app_metadata, handle)
+        with open(dest, "w", encoding="utf-8") as handle:
+            json.dump(app_metadata, handle)
 
     client_id = app_metadata["client_id"]
     client_secret = app_metadata.get("client_secret") or ""
@@ -456,6 +459,7 @@ def finish_authorization(started, redirect_url):
     if not id_token:
         raise RuntimeError("Token response did not include an id_token.")
     user = _id_token_claims(id_token, started["client_id"])
+    _logger.info("access token: %s", _format_access_token_debug(body["access_token"]))
     return body["access_token"], body.get("refresh_token") or "", user, id_token
 
 
@@ -808,12 +812,104 @@ def _odata_quote(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def _format_sta_http_error(exc, href=""):
+def _normalize_bearer_token(token):
+    text = str(token or "").strip().replace("\r", "").replace("\n", "")
+    if text.lower().startswith("bearer "):
+        text = text[7:].strip()
+    return text
+
+
+def _access_token_claims(token):
+    text = _normalize_bearer_token(token)
+    if not text:
+        return {}
+    try:
+        return jwt.decode(
+            text,
+            options={
+                "verify_signature": False,
+                "verify_exp": False,
+                "verify_aud": False,
+            },
+            algorithms=["RS256", "HS256"],
+        )
+    except Exception:
+        return {}
+
+
+def _format_access_token_debug(token):
+    text = _normalize_bearer_token(token)
+    if not text:
+        return "no access token"
+    claims = _access_token_claims(text)
+    if not claims:
+        return "access token is not a JWT (%s chars)" % len(text)
+    aud = claims.get("aud")
+    azp = claims.get("azp") or claims.get("client_id")
+    scope = claims.get("scope") or claims.get("scp")
+    exp = claims.get("exp")
+    bits = ["aud=%s" % aud, "azp=%s" % azp, "scope=%s" % scope]
+    if exp:
+        bits.append("exp in %ss" % (int(exp) - int(time.time())))
+    auds = _as_string_list(aud)
+    if aud is not None and STA_AUDIENCE not in auds and aud != STA_AUDIENCE:
+        bits.append("not issued for the STAplus API")
+    return "; ".join(bits)
+
+
+def _introspect_access_token(token):
+    """Ask AUTHENIX whether this token is active, using the app's client."""
+    text = _normalize_bearer_token(token)
+    if not text:
+        return {}
+    try:
+        client_id, client_secret = registerApp()
+        response = requests.post(
+            AUTHENIX_TOKENINFO,
+            data={"token": text, "token_type_hint": "access_token"},
+            headers={"Accept": "application/json"},
+            auth=HTTPBasicAuth(client_id, client_secret) if client_secret else None,
+            timeout=15,
+        )
+        body = response.json()
+        return body if isinstance(body, dict) else {}
+    except Exception:
+        return {}
+
+
+def assert_sta_access_token(access_token):
+    """Fail early when AUTHENIX will not treat this token as active for STAplus."""
+    token = _normalize_bearer_token(access_token)
+    if not token:
+        raise RuntimeError("Sign in again, then retry Start publishing.")
+    info = _introspect_access_token(token)
+    claims = _access_token_claims(token)
+    debug = _format_access_token_debug(token)
+    if info.get("active") is False:
+        raise RuntimeError(
+            "AUTHENIX reports the access token is not active.\n\n%s\n\n"
+            "Sign out, sign in again, then retry Start publishing."
+            % debug
+        )
+    aud = claims.get("aud")
+    auds = _as_string_list(aud)
+    if aud is not None and STA_AUDIENCE not in auds and aud != STA_AUDIENCE:
+        raise RuntimeError(
+            "The access token is not issued for the STAplus API.\n\n%s\n\n"
+            "Sign out, sign in again, then retry Start publishing."
+            % debug
+        )
+    return info
+
+
+def _format_sta_http_error(exc, href="", token=""):
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
     body = ""
+    www = ""
     if response is not None:
         text = (response.text or "").strip()
+        www = (response.headers.get("WWW-Authenticate") or "").strip()
         try:
             data = response.json()
             if isinstance(data, dict):
@@ -834,14 +930,19 @@ def _format_sta_http_error(exc, href=""):
         msg += "\n\n" + body[:1500]
     else:
         msg += "\n\nThe server returned an empty error body."
+    if www:
+        msg += "\n\n" + www[:800]
     if status in (401, 403):
+        debug = _format_access_token_debug(token)
+        if debug:
+            msg += "\n\n" + debug
         msg += "\n\nSign in again, then retry Start publishing."
     return msg
 
 
 def format_setup_error(err):
     """User-facing text for setup failures; keep HTTP status when the client hid it."""
-    if isinstance(err, RuntimeError) and str(err).startswith("STAplus request failed"):
+    if isinstance(err, RuntimeError):
         return str(err)
     http = err if isinstance(err, requests.exceptions.HTTPError) else getattr(err, "__context__", None)
     if isinstance(http, requests.exceptions.HTTPError):
@@ -853,8 +954,7 @@ def format_setup_error(err):
 
 
 def attach_sta_http_errors(service):
-    """Turn empty/non-JSON HTTP error bodies into a readable RuntimeError."""
-    original = service.execute
+    """Send Bearer only on writes. Anonymous GET is allowed; an inactive token 401s it."""
 
     def execute(method, url, **kwargs):
         href = url if isinstance(url, str) else str(url)
@@ -864,23 +964,22 @@ def attach_sta_http_errors(service):
         handler = getattr(service, "auth_handler", None)
         if handler is not None:
             token = _normalize_bearer_token(getattr(handler, "token", ""))
-        if token:
+        method_l = str(method).lower()
+        if token and method_l not in _STA_SAFE_METHODS:
             headers["Authorization"] = "Bearer " + token
         kwargs["headers"] = headers
+        kwargs.pop("auth", None)
         try:
-            return original(method, href, **kwargs)
+            response = requests.request(
+                method, href, proxies=getattr(service, "proxies", None), **kwargs
+            )
+            response.raise_for_status()
+            return response
         except requests.exceptions.HTTPError as exc:
-            raise RuntimeError(_format_sta_http_error(exc, href)) from exc
+            raise RuntimeError(_format_sta_http_error(exc, href, token)) from exc
 
     service.execute = execute
     return service
-
-
-def _normalize_bearer_token(token):
-    text = str(token or "").strip().replace("\r", "").replace("\n", "")
-    if text.lower().startswith("bearer "):
-        text = text[7:].strip()
-    return text
 
 
 def sta_service(access_token):
