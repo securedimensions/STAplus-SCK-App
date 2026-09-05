@@ -11,9 +11,10 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files, get_package
 
 datas = [
     ("sck_map.html", "."),
-    ("SensorApp.json", "."),
     ("logo.png", "."),
 ]
+if os.path.isfile("SensorApp.json"):
+    datas.append(("SensorApp.json", "."))
 if os.path.isfile("SensorApp.json_"):
     datas.append(("SensorApp.json_", "."))
 if os.path.isdir("vendor/leaflet"):
