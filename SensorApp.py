@@ -873,13 +873,16 @@ def _windows_proxy_debug():
     return "Windows system proxy %s is ignored for STAplus/AUTHENIX." % proxies
 
 
-def _introspect_access_token(token):
+def _introspect_access_token(token, scope=None):
     text = _normalize_bearer_token(token)
     if not text:
         return {}
     meta, _loaded_from = _load_sensor_app_json()
+    data = {"token": text, "token_type_hint": "access_token"}
+    if scope:
+        data["scope"] = scope
     kwargs = {
-        "data": {"token": text, "token_type_hint": "access_token"},
+        "data": data,
         "headers": {"Accept": "application/json"},
         "timeout": 15,
         "proxies": {},
@@ -930,19 +933,16 @@ def _format_access_token_debug(token):
     text = _normalize_bearer_token(token)
     if not text:
         return "no access token"
+    bits = ["Bearer token %s chars" % len(text), "prefix=%s" % text[:12]]
     claims = _access_token_claims(text)
-    if not claims:
-        return "access token is not a JWT (%s chars)" % len(text)
-    aud = claims.get("aud")
-    azp = claims.get("azp") or claims.get("client_id")
-    scope = claims.get("scope") or claims.get("scp")
-    exp = claims.get("exp")
-    bits = ["aud=%s" % aud, "azp=%s" % azp, "scope=%s" % scope]
-    if exp:
-        bits.append("exp in %ss" % (int(exp) - int(time.time())))
-    auds = _as_string_list(aud)
-    if aud is not None and STA_AUDIENCE not in auds and aud != STA_AUDIENCE:
-        bits.append("not issued for the STAplus API")
+    if claims:
+        aud = claims.get("aud")
+        azp = claims.get("azp") or claims.get("client_id")
+        scope = claims.get("scope") or claims.get("scp")
+        exp = claims.get("exp")
+        bits.extend(["aud=%s" % aud, "azp=%s" % azp, "scope=%s" % scope])
+        if exp:
+            bits.append("exp in %ss" % (int(exp) - int(time.time())))
     return "; ".join(bits)
 
 
@@ -985,10 +985,17 @@ def _format_sta_http_error(exc, href="", token=""):
         if proxy_note:
             msg += "\n" + proxy_note
         info = _introspect_access_token(token)
+        info_scoped = _introspect_access_token(token, " ".join(OAUTH_SCOPES))
         if info:
-            msg += "\n\nAUTHENIX tokeninfo active=%s error=%s" % (
+            msg += "\n\nAUTHENIX tokeninfo active=%s scope=%s" % (
                 info.get("active"),
-                info.get("error") or info.get("error_description") or "",
+                info.get("scope") or "",
+            )
+        if info_scoped and info_scoped.get("active") != info.get("active"):
+            msg += "\nAUTHENIX tokeninfo with app scopes active=%s scope=%s error=%s" % (
+                info_scoped.get("active"),
+                info_scoped.get("scope") or "",
+                info_scoped.get("error") or info_scoped.get("error_description") or "",
             )
         msg += "\n\nSign in again, then retry Start publishing."
     return msg

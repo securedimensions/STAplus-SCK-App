@@ -563,6 +563,16 @@ def _qurl_encoded(url):
     return url.toString(QUrl.ComponentFormattingOption.FullyEncoded)
 
 
+def _qurl_from_encoded(href):
+    """Parse an already-encoded http(s) URL without treating '%23' as '#' fragment.
+
+    OAUTH scopes include citiobs.secd.eu#create. Windows QUrl(string) can decode
+    %23 to # and drop the rest of the authorize query, so AUTHENIX never sees
+    the STAplus scopes and FROST then treats the Bearer token as expired.
+    """
+    return QUrl.fromEncoded(QByteArray(href.encode("ascii")))
+
+
 def _qurl_is_logout_redirect(url):
     href = _qurl_encoded(url)
     if sckapp.is_oauth_logout_redirect(href):
@@ -1001,7 +1011,7 @@ class MainWindow(QMainWindow):
         self._authorize_url = url if mode == "login" else ""
         self._consent_retry = False
         self.login_page._captured = False
-        self.login_view.load(QUrl(url))
+        self.login_view.load(_qurl_from_encoded(url))
         self.browser_stack.setCurrentWidget(self.login_view)
 
     def _on_login_cookie_added(self, cookie):
@@ -1019,7 +1029,7 @@ class MainWindow(QMainWindow):
     def _continue_after_consent(self):
         if self._browser_mode != "login" or not self._authorize_url:
             return
-        self.login_view.load(QUrl(self._authorize_url))
+        self.login_view.load(_qurl_from_encoded(self._authorize_url))
 
     def _on_login_url_changed(self, qurl):
         if self._browser_mode == "login" and _qurl_is_oauth_redirect(qurl):
