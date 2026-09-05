@@ -59,6 +59,8 @@ OAUTH_SCOPES = [
     "citiobs.secd.eu#create",
     "citiobs.secd.eu#update",
 ]
+# STAplus demo API audience registered with AUTHENIX.
+STA_AUDIENCE = "3042e50b-dc09-4817-b34c-1b06c709da78"
 AUTHENIX_ORIGIN = "https://authenix.eu"
 AUTHENIX_AUTHORIZE = AUTHENIX_ORIGIN + "/oauth/authorize"
 AUTHENIX_TOKEN = AUTHENIX_ORIGIN + "/oauth/token"
@@ -196,7 +198,10 @@ def _valid_client_metadata(meta):
     if not meta.get("client_secret"):
         return False
     grants = _as_string_list(meta.get("grant_types"))
-    return "authorization_code" in grants
+    if "authorization_code" not in grants:
+        return False
+    audiences = _as_string_list(meta.get("audiences"))
+    return STA_AUDIENCE in audiences
 
 
 def _oauth_form_post(url, form, client_id, client_secret=""):
@@ -245,7 +250,7 @@ def _register_web_client():
         "redirect_uris": [OAUTH_REDIRECT_URI],
         "post_logout_redirect_uris": [OAUTH_LOGOUT_REDIRECT_URI],
         "logout_uri": OAUTH_LOGOUT_REDIRECT_URI,
-        "audiences": ["3042e50b-dc09-4817-b34c-1b06c709da78"],
+        "audiences": [STA_AUDIENCE],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code", "code id_token"],
         "client_name": "STAplus SCK App",
@@ -320,7 +325,11 @@ def updateTokens(refresh_token):
     client_id, client_secret = registerApp()
     response = _oauth_form_post(
         AUTHENIX_TOKEN,
-        {"grant_type": "refresh_token", "refresh_token": refresh_token},
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "audience": STA_AUDIENCE,
+        },
         client_id,
         client_secret,
     )
@@ -395,6 +404,7 @@ def start_authorization():
             "response_type": "code",
             "response_mode": "query",
             "scope": " ".join(OAUTH_SCOPES),
+            "audience": STA_AUDIENCE,
             "state": state,
             "nonce": nonce,
             "code_challenge": challenge,
@@ -430,6 +440,7 @@ def finish_authorization(started, redirect_url):
             "code": code,
             "redirect_uri": OAUTH_REDIRECT_URI,
             "code_verifier": started["code_verifier"],
+            "audience": STA_AUDIENCE,
         },
         started["client_id"],
         started["client_secret"],
@@ -848,6 +859,14 @@ def attach_sta_http_errors(service):
     def execute(method, url, **kwargs):
         href = url if isinstance(url, str) else str(url)
         kwargs.setdefault("timeout", 60)
+        headers = dict(kwargs.get("headers") or {})
+        token = ""
+        handler = getattr(service, "auth_handler", None)
+        if handler is not None:
+            token = _normalize_bearer_token(getattr(handler, "token", ""))
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        kwargs["headers"] = headers
         try:
             return original(method, href, **kwargs)
         except requests.exceptions.HTTPError as exc:
@@ -857,8 +876,15 @@ def attach_sta_http_errors(service):
     return service
 
 
+def _normalize_bearer_token(token):
+    text = str(token or "").strip().replace("\r", "").replace("\n", "")
+    if text.lower().startswith("bearer "):
+        text = text[7:].strip()
+    return text
+
+
 def sta_service(access_token):
-    auth = auth_handler.AuthHandler(access_token)
+    auth = auth_handler.AuthHandler(_normalize_bearer_token(access_token))
     return attach_sta_http_errors(dggs.compose(url, auth_handler=auth))
 
 

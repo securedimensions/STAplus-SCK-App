@@ -144,10 +144,15 @@ def _prepare_frozen_workdir():
         return
     support = _app_support_dir()
     os.makedirs(support, exist_ok=True)
-    bundled = os.path.join(_bundle_dir(), "SensorApp.json")
     dest = os.path.join(support, "SensorApp.json")
-    if os.path.isfile(bundled) and (not os.path.isfile(dest) or not _oauth_json_usable(dest)):
-        shutil.copy2(bundled, dest)
+    preferred = None
+    for name in ("SensorApp.json_", "SensorApp.json"):
+        bundled = os.path.join(_bundle_dir(), name)
+        if os.path.isfile(bundled) and _oauth_json_usable(bundled):
+            preferred = bundled
+            break
+    if preferred:
+        shutil.copy2(preferred, dest)
     os.chdir(support)
 
 
@@ -1523,6 +1528,18 @@ class MainWindow(QMainWindow):
             return
         name = self.name_edit.text().strip() or "SCK location"
         save_location_cache(self.lat, self.lon, name)
+        if self.refresh_token:
+            try:
+                self.access_token, self.refresh_token = sckapp.updateTokens(self.refresh_token)
+            except Exception as err:
+                QMessageBox.warning(
+                    self,
+                    "Sign-in expired",
+                    "Could not refresh the AUTHENIX token. Sign in again, then retry Start publishing.\n\n%s"
+                    % err,
+                )
+                self.start_btn.setEnabled(True)
+                return
         loc = staPlus.Location(
             name=name,
             description="Location chosen in the SCK desktop app",
