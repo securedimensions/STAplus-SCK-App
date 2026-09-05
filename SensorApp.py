@@ -42,7 +42,7 @@ import webbrowser
 import jwt
 from jwt import PyJWKClient
 from typing import Tuple
-from urllib.parse import parse_qsl, urlencode, urlsplit
+from urllib.parse import unquote, urlencode, urlsplit
 from requests.auth import HTTPBasicAuth
 import staplus_client as staPlus
 import sta_dggs_client as dggs
@@ -65,6 +65,7 @@ AUTHENIX_ORIGIN = "https://authenix.eu"
 AUTHENIX_AUTHORIZE = AUTHENIX_ORIGIN + "/oauth/authorize"
 AUTHENIX_TOKEN = AUTHENIX_ORIGIN + "/oauth/token"
 AUTHENIX_JWKS = AUTHENIX_ORIGIN + "/.well-known/jwks.json"
+AUTHENIX_TOKENINFO = AUTHENIX_ORIGIN + "/oauth/tokeninfo"
 AUTHENIX_REGISTER = AUTHENIX_ORIGIN + "/oauth/register"
 AUTHENIX_LOGOUT = AUTHENIX_ORIGIN + "/openid/logout"
 OAUTH_REDIRECT_URI = "http://127.0.0.1:4711/SensorApp"
@@ -201,6 +202,23 @@ def _valid_client_metadata(meta):
     return "authorization_code" in grants
 
 
+def _http_session():
+    """STAplus/AUTHENIX HTTP that ignores Windows Internet Settings proxies.
+
+    requests.trust_env is on by default, so Windows registry PAC/HTTP_PROXY
+    can rewrite or fold the Authorization header. FROST then introspects a
+    broken Bearer and returns HTTP 401 with an empty body.
+    """
+    session = getattr(_http_session, "_session", None)
+    if session is None:
+        session = requests.Session()
+        session.trust_env = False
+        session.proxies = {}
+        session.headers.update({"Accept": "application/json"})
+        _http_session._session = session
+    return session
+
+
 def _oauth_form_post(url, form, client_id, client_secret=""):
     data = dict(form)
     data["client_id"] = client_id
@@ -211,11 +229,12 @@ def _oauth_form_post(url, form, client_id, client_secret=""):
             "Content-Type": "application/x-www-form-urlencoded",
         },
         "timeout": 30,
+        "proxies": {},
     }
     if client_secret:
         data["client_secret"] = client_secret
         kwargs["auth"] = HTTPBasicAuth(client_id, client_secret)
-    return requests.post(url, **kwargs)
+    return _http_session().post(url, **kwargs)
 
 
 def _load_sensor_app_json():
@@ -225,7 +244,6 @@ def _load_sensor_app_json():
         candidates.append(os.path.join(meipass, "SensorApp.json"))
     here = os.path.dirname(os.path.abspath(__file__))
     candidates.append(os.path.join(here, "SensorApp.json"))
-    candidates.append(os.path.join(here, "SensorApp.json_"))
     seen = set()
     for path in candidates:
         if path in seen or not os.path.isfile(path):
@@ -271,11 +289,12 @@ def _register_web_client():
     for attempt in range(2):
         if attempt:
             time.sleep(11)
-        response = requests.post(
+        response = _http_session().post(
             AUTHENIX_REGISTER,
             json=request,
             headers={"Accept": "application/json"},
             timeout=30,
+            proxies={},
         )
         try:
             body = response.json()
@@ -380,10 +399,22 @@ def logout_url(id_token=""):
     return AUTHENIX_LOGOUT + "?" + urlencode(params)
 
 
+def _parse_oauth_query(query):
+    params = {}
+    for part in (query or "").lstrip("?").split("&"):
+        if not part:
+            continue
+        key, _, val = part.partition("=")
+        # unquote, not parse_qsl: '+' is valid in AUTHENIX codes. Windows QUrl
+        # PrettyDecoded turns %2B into '+', and parse_qsl then turns that into a space.
+        params[unquote(key)] = unquote(val)
+    return params
+
+
 def _parse_oauth_redirect(url):
     parts = urlsplit(url)
-    params = dict(parse_qsl(parts.query, keep_blank_values=True))
-    params.update(dict(parse_qsl(parts.fragment, keep_blank_values=True)))
+    params = _parse_oauth_query(parts.query)
+    params.update(_parse_oauth_query(parts.fragment))
     return params
 
 
@@ -803,10 +834,64 @@ def _odata_quote(value):
 
 
 def _normalize_bearer_token(token):
-    text = str(token or "").strip().replace("\r", "").replace("\n", "")
-    if text.lower().startswith("bearer "):
-        text = text[7:].strip()
-    return text
+    text = str(token or "")
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    # JWTs cannot contain whitespace; Windows proxies and QString can inject CR/LF.
+    text = "".join(text.split())
+    if text.lower().startswith("bearer"):
+        text = text[6:].lstrip(":")
+    try:
+        return text.encode("ascii").decode("ascii")
+    except UnicodeEncodeError:
+        return text.encode("ascii", "ignore").decode("ascii")
+
+
+def _authorization_header(token):
+    return "Bearer " + _normalize_bearer_token(token)
+
+
+def _authorization_wire_debug(token):
+    raw = _authorization_header(token).encode("ascii", "replace")
+    return "Authorization %d bytes head=%s tail=%s" % (
+        len(raw),
+        raw[:16].hex(),
+        raw[-8:].hex(),
+    )
+
+
+def _windows_proxy_debug():
+    if sys.platform != "win32":
+        return ""
+    try:
+        from urllib.request import getproxies
+        proxies = {key: value for key, value in getproxies().items() if value}
+    except Exception:
+        return ""
+    if not proxies:
+        return ""
+    return "Windows system proxy %s is ignored for STAplus/AUTHENIX." % proxies
+
+
+def _introspect_access_token(token):
+    text = _normalize_bearer_token(token)
+    if not text:
+        return {}
+    meta, _loaded_from = _load_sensor_app_json()
+    kwargs = {
+        "data": {"token": text, "token_type_hint": "access_token"},
+        "headers": {"Accept": "application/json"},
+        "timeout": 15,
+        "proxies": {},
+    }
+    if meta.get("client_id") and meta.get("client_secret"):
+        kwargs["auth"] = HTTPBasicAuth(meta["client_id"], meta["client_secret"])
+    try:
+        response = _http_session().post(AUTHENIX_TOKENINFO, **kwargs)
+        body = response.json()
+        return body if isinstance(body, dict) else {"raw": response.text[:300]}
+    except Exception as err:
+        return {"error": str(err)}
 
 
 def access_token_usable(token, skew=30):
@@ -895,6 +980,16 @@ def _format_sta_http_error(exc, href="", token=""):
         debug = _format_access_token_debug(token)
         if debug:
             msg += "\n\n" + debug
+        msg += "\n\n" + _authorization_wire_debug(token)
+        proxy_note = _windows_proxy_debug()
+        if proxy_note:
+            msg += "\n" + proxy_note
+        info = _introspect_access_token(token)
+        if info:
+            msg += "\n\nAUTHENIX tokeninfo active=%s error=%s" % (
+                info.get("active"),
+                info.get("error") or info.get("error_description") or "",
+            )
         msg += "\n\nSign in again, then retry Start publishing."
     return msg
 
@@ -913,8 +1008,8 @@ def format_setup_error(err):
 
 
 def attach_sta_http_errors(service):
-    """Turn empty/non-JSON HTTP error bodies into a readable RuntimeError."""
-    original = service.execute
+    """Send a raw ASCII Bearer header and ignore Windows system proxies."""
+    session = _http_session()
 
     def execute(method, url, **kwargs):
         href = url if isinstance(url, str) else str(url)
@@ -923,8 +1018,21 @@ def attach_sta_http_errors(service):
         handler = getattr(service, "auth_handler", None)
         if handler is not None:
             token = _normalize_bearer_token(getattr(handler, "token", ""))
+        headers = dict(kwargs.pop("headers", None) or {})
+        if token:
+            headers["Authorization"] = _authorization_header(token)
+        headers.setdefault("Accept", "application/json")
+        kwargs.pop("auth", None)
         try:
-            return original(method, href, **kwargs)
+            response = session.request(
+                method,
+                href,
+                headers=headers,
+                proxies={},
+                **kwargs,
+            )
+            response.raise_for_status()
+            return response
         except requests.exceptions.HTTPError as exc:
             raise RuntimeError(_format_sta_http_error(exc, href, token)) from exc
 

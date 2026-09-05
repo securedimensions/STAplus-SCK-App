@@ -554,8 +554,17 @@ class SerialWorker(QThread):
             self.finished_ok.emit()
 
 
+def _qurl_encoded(url):
+    """Keep AUTHENIX query bytes as Chromium sent them.
+
+    QUrl.toString() on Windows PrettyDecodes %2B to '+', which later parsers
+    treat as a space and corrupt the authorization code.
+    """
+    return url.toString(QUrl.ComponentFormattingOption.FullyEncoded)
+
+
 def _qurl_is_logout_redirect(url):
-    href = url.toString()
+    href = _qurl_encoded(url)
     if sckapp.is_oauth_logout_redirect(href):
         return True
     if url.host().lower() not in ("127.0.0.1", "localhost"):
@@ -568,7 +577,7 @@ def _qurl_is_logout_redirect(url):
 def _qurl_is_oauth_redirect(url):
     if _qurl_is_logout_redirect(url):
         return False
-    href = url.toString()
+    href = _qurl_encoded(url)
     if sckapp.is_oauth_redirect(href):
         return True
     if url.host().lower() not in ("127.0.0.1", "localhost"):
@@ -603,7 +612,7 @@ class LoginPage(QWebEnginePage):
         if _qurl_is_loopback_handoff(url):
             if not self._captured:
                 self._captured = True
-                self.oauthRedirect.emit(url.toString())
+                self.oauthRedirect.emit(_qurl_encoded(url))
             return False
         return True
 
@@ -631,7 +640,7 @@ class OauthRedirectInterceptor(QWebEngineUrlRequestInterceptor):
         url = info.requestUrl()
         if _qurl_is_loopback_handoff(url):
             info.block(True)
-            self.captured.emit(url.toString())
+            self.captured.emit(_qurl_encoded(url))
 
 
 class CollapsibleCard(QWidget):
@@ -1014,7 +1023,7 @@ class MainWindow(QMainWindow):
 
     def _on_login_url_changed(self, qurl):
         if self._browser_mode == "login" and _qurl_is_oauth_redirect(qurl):
-            self._on_oauth_redirect(qurl.toString())
+            self._on_oauth_redirect(_qurl_encoded(qurl))
             return
         if self._browser_mode == "logout" and _qurl_is_logout_redirect(qurl):
             self._finish_logout()
@@ -1535,19 +1544,18 @@ class MainWindow(QMainWindow):
             return
         name = self.name_edit.text().strip() or "SCK location"
         save_location_cache(self.lat, self.lon, name)
-        if self.refresh_token:
+        if self.refresh_token and not sckapp.access_token_usable(self.access_token):
             try:
                 self.access_token, self.refresh_token = sckapp.updateTokens(self.refresh_token)
             except Exception as err:
-                if not sckapp.access_token_usable(self.access_token):
-                    QMessageBox.warning(
-                        self,
-                        "Sign-in expired",
-                        "Could not refresh the AUTHENIX token. Sign in again, then retry Start publishing.\n\n%s"
-                        % err,
-                    )
-                    self.start_btn.setEnabled(True)
-                    return
+                QMessageBox.warning(
+                    self,
+                    "Sign-in expired",
+                    "Could not refresh the AUTHENIX token. Sign in again, then retry Start publishing.\n\n%s"
+                    % err,
+                )
+                self.start_btn.setEnabled(True)
+                return
         loc = staPlus.Location(
             name=name,
             description="Location chosen in the SCK desktop app",
