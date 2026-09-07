@@ -49,7 +49,8 @@ import sta_dggs_client as dggs
 
 FIRST_RECONNECT_DELAY = 1
 MAX_RECONNECT_DELAY = 60
-# Refresh MQTT bearer token before the typical 30-minute expiry
+# AUTHENIX access tokens last 1800s; refresh ahead of that with the offline_access RT.
+ACCESS_TOKEN_LIFETIME = 1800
 TOKEN_REFRESH_INTERVAL = 25 * 60
 OAUTH_SCOPES = [
     "openid",
@@ -315,7 +316,7 @@ def _register_web_client():
         "post_logout_redirect_uris": [OAUTH_LOGOUT_REDIRECT_URI],
         "logout_uri": OAUTH_LOGOUT_REDIRECT_URI,
         "audiences": [STA_AUDIENCE],
-        "grant_types": ["authorization_code"],
+        "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code", "code id_token"],
         "client_name": "STAplus SCK App",
         "logo_uri": AUTHENIX_REGISTER_LOGO_URI,
@@ -387,6 +388,25 @@ def registerApp() -> Tuple[str, str]:
     return client_id, client_secret
 
 
+def _access_token_expires_at(body, issued_at=None):
+    """Unix time when the access token should be treated as expired."""
+    issued_at = time.time() if issued_at is None else float(issued_at)
+    expires_in = body.get("expires_in")
+    if expires_in is not None:
+        try:
+            return issued_at + max(0, int(expires_in))
+        except (TypeError, ValueError):
+            pass
+    claims = _access_token_claims(body.get("access_token") or "")
+    exp = claims.get("exp")
+    if exp is not None:
+        try:
+            return float(exp)
+        except (TypeError, ValueError):
+            pass
+    return issued_at + ACCESS_TOKEN_LIFETIME
+
+
 def updateTokens(refresh_token):
     client_id, client_secret = registerApp()
     response = _oauth_form_post(
@@ -405,7 +425,25 @@ def updateTokens(refresh_token):
     if response.status_code != 200 or not body.get("access_token"):
         detail = body.get("error_description") or body.get("error") or response.text[:300]
         raise RuntimeError("Token refresh failed: %s" % detail)
-    return body["access_token"], body.get("refresh_token") or refresh_token
+    expires_at = _access_token_expires_at(body)
+    _logger.info(
+        "Refreshed AUTHENIX access token; expires in %ss",
+        max(0, int(expires_at - time.time())),
+    )
+    return (
+        body["access_token"],
+        body.get("refresh_token") or refresh_token,
+        expires_at,
+    )
+
+
+def ensure_fresh_tokens(access_token, refresh_token, expires_at=None, skew=60):
+    """Return a still-valid access token, refreshing with offline_access when needed."""
+    if refresh_token and not access_token_usable(
+        access_token, skew=skew, expires_at=expires_at
+    ):
+        return updateTokens(refresh_token)
+    return access_token, refresh_token, expires_at
 
 
 class DeviceAuthCancelled(Exception):
@@ -531,7 +569,13 @@ def finish_authorization(started, redirect_url):
     if not id_token:
         raise RuntimeError("Token response did not include an id_token.")
     user = _id_token_claims(id_token, started["client_id"])
-    return body["access_token"], body.get("refresh_token") or "", user, id_token
+    return (
+        body["access_token"],
+        body.get("refresh_token") or "",
+        user,
+        id_token,
+        _access_token_expires_at(body),
+    )
 
 
 def authorize():
@@ -561,22 +605,25 @@ def authorize():
     httpd.server_close()
     if not result["url"]:
         raise RuntimeError("Timed out waiting for AUTHENIX sign-in.")
-    access_token, refresh_token, user, _id_token = finish_authorization(started, result["url"])
+    access_token, refresh_token, user, _id_token, expires_at = finish_authorization(
+        started, result["url"]
+    )
     _logger.info(user)
-    return access_token, refresh_token, user
+    return access_token, refresh_token, user, expires_at
 
 def refresh_mqtt_auth(client):
     """Refresh OAuth tokens and update MQTT username/password for the next connect."""
     userdata = client.user_data_get()
-    access_token, refresh_token = updateTokens(userdata['refresh_token'])
+    access_token, refresh_token, expires_at = updateTokens(userdata['refresh_token'])
     userdata['access_token'] = access_token
     userdata['refresh_token'] = refresh_token
+    userdata['expires_at'] = expires_at
     userdata['last_refresh'] = time.time()
     client.username_pw_set('Bearer', access_token)
     _logger.debug('MQTT credentials refreshed')
     return access_token, refresh_token
 
-def connect_mqtt(token, refresh_token):
+def connect_mqtt(token, refresh_token, expires_at=None):
     def on_connect(client, userdata, flags, reason_code, properties):
         if reason_code == 0:
             print("Connected to MQTT Broker!")
@@ -597,6 +644,7 @@ def connect_mqtt(token, refresh_token):
     userdata = {
         'access_token': token,
         'refresh_token': refresh_token,
+        'expires_at': expires_at,
         'last_refresh': time.time(),
         'shutting_down': False,
     }
@@ -846,7 +894,12 @@ def publish(service, client, config, party, sck, loc=None):
     start_sck_monitor(sck)
     while True:
         userdata = client.user_data_get()
-        if time.time() - userdata.get('last_refresh', 0) >= TOKEN_REFRESH_INTERVAL:
+        token_stale = not access_token_usable(
+            userdata.get('access_token'),
+            expires_at=userdata.get('expires_at'),
+        )
+        interval_due = time.time() - userdata.get('last_refresh', 0) >= TOKEN_REFRESH_INTERVAL
+        if token_stale or interval_due:
             try:
                 refresh_mqtt_auth(client)
             except Exception as err:
@@ -947,18 +1000,29 @@ def _introspect_access_token(token, scope=None):
         return {"error": str(err)}
 
 
-def access_token_usable(token, skew=30):
+def access_token_usable(token, skew=30, expires_at=None):
+    """True if the access token is still within its lifetime.
+
+    AUTHENIX issues opaque tokens with no JWT exp, so callers should pass
+    expires_at from the token response's expires_in. Without that, opaque
+    tokens are treated as unusable so the refresh_token path can run.
+    """
     text = _normalize_bearer_token(token)
     if not text:
         return False
+    if expires_at is not None:
+        try:
+            return float(expires_at) > time.time() + int(skew)
+        except (TypeError, ValueError):
+            pass
     claims = _access_token_claims(text)
     exp = claims.get("exp")
     if exp is None:
-        return True
+        return False
     try:
         return int(exp) > int(time.time()) + int(skew)
     except (TypeError, ValueError):
-        return True
+        return False
 
 
 def _access_token_claims(token):
@@ -1357,12 +1421,15 @@ def on_publish(client, userdata, mid, reason_code, properties):
 
 if __name__ == "__main__":
     configure_ssl_certs()
-    access_token, refresh_token, user = authorize()
+    access_token, refresh_token, user, expires_at = authorize()
+    access_token, refresh_token, expires_at = ensure_fresh_tokens(
+        access_token, refresh_token, expires_at
+    )
     service = sta_service(access_token)
     _logger.debug("processing with access token: " + access_token)
     config = setup(service, user, location)
     party = service.parties().find(user['sub'])
-    client = connect_mqtt(access_token, refresh_token)
+    client = connect_mqtt(access_token, refresh_token, expires_at)
     sck = Serial(DEFAULT_SCK_PORT, SCK_BAUD, timeout=10)
     try:
         publish(service, client, config, party, sck, location)

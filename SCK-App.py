@@ -456,7 +456,7 @@ class MapBridge(QObject):
 
 class AuthCodeWorker(QThread):
     needs_browser = pyqtSignal(str)
-    succeeded = pyqtSignal(str, str, object, str)
+    succeeded = pyqtSignal(str, str, object, str, float)
     failed = pyqtSignal(str)
 
     def __init__(self, parent=None):
@@ -489,10 +489,10 @@ class AuthCodeWorker(QThread):
                     raise RuntimeError("Timed out waiting for AUTHENIX sign-in.")
             if self._stop or not self._redirect:
                 raise sckapp.DeviceAuthCancelled()
-            access_token, refresh_token, user, id_token = sckapp.finish_authorization(
+            access_token, refresh_token, user, id_token, expires_at = sckapp.finish_authorization(
                 started, self._redirect
             )
-            self.succeeded.emit(access_token, refresh_token, user, id_token)
+            self.succeeded.emit(access_token, refresh_token, user, id_token, expires_at)
         except sckapp.DeviceAuthCancelled:
             return
         except Exception:
@@ -719,6 +719,7 @@ class MainWindow(QMainWindow):
 
         self.access_token = None
         self.refresh_token = None
+        self.access_token_expires_at = None
         self.id_token = None
         self.user = None
         self.service = None
@@ -895,7 +896,7 @@ class MainWindow(QMainWindow):
 
         self.token_timer = QTimer(self)
         self.token_timer.setInterval(sckapp.TOKEN_REFRESH_INTERVAL * 1000)
-        self.token_timer.timeout.connect(self.refresh_mqtt_token)
+        self.token_timer.timeout.connect(self.refresh_session_tokens)
 
         self.reload_ports()
         self._update_start_enabled()
@@ -1081,8 +1082,10 @@ class MainWindow(QMainWindow):
         self._update_account_ui()
 
     def _clear_local_session(self):
+        self.token_timer.stop()
         self.access_token = None
         self.refresh_token = None
+        self.access_token_expires_at = None
         self.id_token = None
         self.user = None
         self.service = None
@@ -1093,6 +1096,7 @@ class MainWindow(QMainWindow):
     def start_logout(self):
         if self.publishing:
             self.stop_publishing()
+        self.token_timer.stop()
         if self.auth_worker is not None and self.auth_worker.isRunning():
             self.auth_worker.stop()
             self._set_sign_in_busy(False)
@@ -1431,9 +1435,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Sign-in cancelled.")
         self._show_map_page()
 
-    def on_signed_in(self, access_token, refresh_token, user, id_token=""):
+    def on_signed_in(self, access_token, refresh_token, user, id_token="", expires_at=0.0):
         self.access_token = access_token
         self.refresh_token = refresh_token
+        self.access_token_expires_at = expires_at or (
+            time.time() + sckapp.ACCESS_TOKEN_LIFETIME
+        )
         self.id_token = id_token or ""
         self.user = user
         name = user.get("preferred_username") or user.get("sub") or "signed in"
@@ -1443,6 +1450,8 @@ class MainWindow(QMainWindow):
         self._show_map_page()
         self._update_start_enabled()
         self._update_account_ui()
+        if self.refresh_token:
+            self.token_timer.start()
 
     def on_sign_in_failed(self, error):
         self._set_sign_in_busy(False)
@@ -1505,8 +1514,16 @@ class MainWindow(QMainWindow):
                 self._show_readings(values)
                 if self.mqtt_client is not None:
                     userdata = self.mqtt_client.user_data_get()
-                    if time.time() - userdata.get("last_refresh", 0) >= sckapp.TOKEN_REFRESH_INTERVAL:
-                        self.refresh_mqtt_token()
+                    token_stale = not sckapp.access_token_usable(
+                        self.access_token,
+                        expires_at=self.access_token_expires_at,
+                    )
+                    interval_due = (
+                        time.time() - userdata.get("last_refresh", 0)
+                        >= sckapp.TOKEN_REFRESH_INTERVAL
+                    )
+                    if token_stale or interval_due:
+                        self.refresh_session_tokens()
                     sckapp.publish_sample(self.mqtt_client, self.party, self.publish_ctx, values)
             except Exception:
                 self.statusBar().showMessage("Publish failed; see console.")
@@ -1563,9 +1580,15 @@ class MainWindow(QMainWindow):
             return
         name = self.name_edit.text().strip() or "SCK location"
         save_location_cache(self.lat, self.lon, name)
-        if self.refresh_token and not sckapp.access_token_usable(self.access_token):
+        if self.refresh_token:
             try:
-                self.access_token, self.refresh_token = sckapp.updateTokens(self.refresh_token)
+                self.access_token, self.refresh_token, self.access_token_expires_at = (
+                    sckapp.ensure_fresh_tokens(
+                        self.access_token,
+                        self.refresh_token,
+                        self.access_token_expires_at,
+                    )
+                )
             except Exception as err:
                 QMessageBox.warning(
                     self,
@@ -1594,14 +1617,17 @@ class MainWindow(QMainWindow):
         self.party = party
         try:
             self.publish_ctx = sckapp.prepare_publish(service, config)
-            self.mqtt_client = sckapp.connect_mqtt(self.access_token, self.refresh_token)
+            self.mqtt_client = sckapp.connect_mqtt(
+                self.access_token, self.refresh_token, self.access_token_expires_at
+            )
         except Exception:
             self.start_btn.setEnabled(True)
             QMessageBox.critical(self, "MQTT failed", traceback.format_exc())
             return
         self.publishing = True
         self.stop_btn.setEnabled(True)
-        self.token_timer.start()
+        if self.refresh_token and not self.token_timer.isActive():
+            self.token_timer.start()
         self.statusBar().showMessage(
             f"Publishing to Thing {config.get('thing_id')} (new Datastreams this session)."
         )
@@ -1612,20 +1638,31 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "STAplus setup failed", error)
         self._update_start_enabled()
 
-    def refresh_mqtt_token(self):
-        if self.mqtt_client is None:
-            return
+    def refresh_session_tokens(self):
+        if not self.refresh_token:
+            return False
         try:
-            sckapp.refresh_mqtt_auth(self.mqtt_client)
-            userdata = self.mqtt_client.user_data_get()
-            self.access_token = userdata.get("access_token", self.access_token)
-            self.refresh_token = userdata.get("refresh_token", self.refresh_token)
+            access_token, refresh_token, expires_at = sckapp.updateTokens(self.refresh_token)
+            self.access_token = access_token
+            self.refresh_token = refresh_token
+            self.access_token_expires_at = expires_at
+            if self.mqtt_client is not None:
+                userdata = self.mqtt_client.user_data_get()
+                userdata["access_token"] = access_token
+                userdata["refresh_token"] = refresh_token
+                userdata["expires_at"] = expires_at
+                userdata["last_refresh"] = time.time()
+                self.mqtt_client.username_pw_set("Bearer", access_token)
+            return True
         except Exception as err:
             self.statusBar().showMessage(f"Token refresh failed: {err}")
+            return False
+
+    def refresh_mqtt_token(self):
+        self.refresh_session_tokens()
 
     def stop_publishing(self):
         self.publishing = False
-        self.token_timer.stop()
         self.stop_btn.setEnabled(False)
         if self.mqtt_client is not None:
             try:
