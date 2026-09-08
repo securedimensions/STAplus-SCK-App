@@ -20,7 +20,9 @@ The service endpoint used to upload observations for human users (`Party/role ==
 
 To avoid creating personal information via `FeatureOfInterest`, do not use a geometry unless the observed feature is a publicly observable object such as a lake, a public park, or a public building. In those cases, `FeatureOfInterest/Feature/geometry` may describe the spatial extent. For a private home, garden, and similar features, the geometry should be `null`.
 
-This application uploads observations with a feature of interest that is "The World" and has no geometry. Change that feature of interest if needed before publishing.
+By default this application uploads observations with a feature of interest named **The World** and no geometry. In the desktop app you can look up named public OpenStreetMap places near the marker (parks, lakes, civic buildings, schools, and similar). Selecting one of those objects uses it as the Feature of Interest **with its public geometry**. Private homes are not listed. If you do not select a place, publishing still uses The World with no geometry.
+
+The lookup uses the public Overpass API and requires network access.
 
 The configured STAplus endpoint follows the STAplus 1.0.1 corrigendum GDPR note: access to `/Locations` and `HistoricalLocations` is granted only to the user linked to `Thing/Party`. The access token’s Bearer subject must equal `Thing/Party/authId`. Anonymous or other users receive an empty JSON array.
 
@@ -44,14 +46,18 @@ The desktop app lists ports in **Smart Citizen Kit**; pick the kit and click **C
 Left-hand cards (each can be collapsed from its title):
 
 1. **Smart Citizen Kit** — choose the serial port and connect
-2. **Location** — name, marker coordinates, **Use this marker**
+2. **Location** — name, marker coordinates, **Use this marker**, **Find nearby places**
 3. **Account** — AUTHENIX **Sign in** / **Log out**
 4. **STAplus** — **Start publishing** / **Stop**
 5. **Live readings** — latest sample; after the kit is connected, click the map marker for charts
 
+**Show log** at the bottom of the left column opens captured `print()` output, Python logging, and map JavaScript console messages. The window follows new lines as they arrive. **Open log file** and **Show in folder** use the OS so you can attach `sck.log` when reporting an issue. When you run from source, the same lines still go to the terminal.
+
 The map is on the right. Click or drag the marker, then confirm it before publishing. **Use my location** uses the computer’s location: on macOS the bundled `sck-locate` helper (enable Location Services for STAplus SCK if macOS asks); on Windows, Windows Location (Settings → Privacy → Location, and allow desktop apps).
 
-**Start publishing** is enabled when you are signed in, the kit is connected, and the marker is confirmed.
+**Find nearby places** queries OpenStreetMap (Overpass) within 300 m of the marker and draws named public parks, lakes, and civic/public buildings. Click one to use it as the Feature of Interest. **Clear FoI** returns to The World (no geometry). Moving the Thing marker clears the place overlay so you can search again. The Thing location stays on the marker; the selected place is only the observed feature.
+
+**Start publishing** is enabled when you are signed in, the kit is connected, and the marker is confirmed. A Feature of Interest selection is optional.
 
 ### AUTHENIX sign-in and logout
 
@@ -65,7 +71,8 @@ Cookie and profile data live under the application support directory:
 
 WebEngine profile: `…/QtWebEngine/sck-authenix`  
 OAuth client file used when frozen: `SensorApp.json` in that same support directory  
-Last map position: `sck_location.json`
+Last map position: `sck_location.json`  
+Debug log: `sck.log` (and `sck.log.1` after rotation)
 
 **Log out** calls AUTHENIX `https://authenix.eu/openid/logout` in the same embedded profile so the AUTHENIX session cookies are cleared. Consent (`ASCookieConsent`) is kept. After logout, **Sign in** can be used for a different account.
 
@@ -152,7 +159,7 @@ Windows (produces `dist\STAplus SCK\STAplus SCK.exe`):
 build-windows-app.bat
 ```
 
-The frozen app stores `SensorApp.json` and location cache under the application support directory above, not inside the `.app` / `_internal` tree.
+The frozen app stores `SensorApp.json`, the location cache, and `sck.log` under the application support directory above, not inside the `.app` / `_internal` tree.
 
 Launch the newly built `dist/STAplus SCK.app` (macOS) or `STAplus SCK.exe` (Windows). Do not keep using an older copy after a rebuild.
 

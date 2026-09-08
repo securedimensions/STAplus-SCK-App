@@ -15,8 +15,6 @@ datas = [
 ]
 if os.path.isfile("SensorApp.json"):
     datas.append(("SensorApp.json", "."))
-if os.path.isfile("SensorApp.json_"):
-    datas.append(("SensorApp.json_", "."))
 if os.path.isdir("vendor/leaflet"):
     datas.append(("vendor/leaflet", "vendor/leaflet"))
 _locate_app = os.path.join("vendor", "sck-locate", "sck-locate.app")

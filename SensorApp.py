@@ -25,9 +25,10 @@ import math
 
 import staplus_client.model.feature_of_interest
 from staplus_client.utils import transform_entity_to_json_dict
-from geojson import Point, Feature
+from geojson import Point, Feature, LineString, Polygon, MultiPolygon
 from staplus_client.service import auth_handler
 from paho.mqtt import client as mqtt_client
+from paho.mqtt.client import error_string
 from paho.mqtt.enums import MQTTErrorCode  # For paho-mqtt v2.x readability
 from datetime import datetime, timezone
 from serial import Serial
@@ -89,6 +90,10 @@ broker = 'citiobs.demo.secure-dimensions.de'
 port = 3883
 #port = 1883
 topic = "v1.1/Observations"
+MQTT_PUBLISH_TOPIC = "v1.1/ObservationGroups"
+# FROST MQTT does not PUBACK ObservationGroups; QoS 1 times out with rc=0.
+MQTT_PUBLISH_QOS = 0
+MQTT_PUBLISH_TIMEOUT = 5
 client_id = f'python-mqtt-{random.randint(0, 1000)}'
 kit_id = '16526'
 #location = staPlus.Location(name="Spitzingsee", description="A nice place on Earth", location=Point((11.885329792,47.659664028)), encoding_type='application/geo+json')
@@ -139,6 +144,297 @@ def get_elevation(lat: float, lon: float, timeout: float = 10.0) -> float:
     resp.raise_for_status()
     data = resp.json()
     return float(data["results"][0]["elevation"])
+
+
+OVERPASS_ENDPOINTS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+)
+OVERPASS_USER_AGENT = (
+    "STAplus-SCK-App/1.3 (https://github.com/securedimensions/STAplus-SCK-App)"
+)
+NEARBY_PLACES_RADIUS_M = 300
+NEARBY_PLACES_LIMIT = 40
+_OVERPASS_LEISURE = "park|playground|garden|nature_reserve"
+_OVERPASS_NATURAL = "water|wood"
+_OVERPASS_AMENITY = (
+    "school|university|college|library|hospital|clinic|townhall|"
+    "community_centre|theatre|cinema|place_of_worship|arts_centre"
+)
+_OVERPASS_TOURISM = "museum|attraction|gallery"
+_OVERPASS_BUILDING = "public|civic|school|university|hospital|church|cathedral"
+
+
+def _haversine_m(lat1, lon1, lat2, lon2):
+    radius = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+    return 2 * radius * math.asin(math.sqrt(min(1.0, a)))
+
+
+def _overpass_coords(geom):
+    coords = []
+    for pt in geom or []:
+        try:
+            coords.append([float(pt["lon"]), float(pt["lat"])])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return coords
+
+
+def _close_ring(coords):
+    if len(coords) < 3:
+        return coords
+    if coords[0] != coords[-1]:
+        return coords + [coords[0]]
+    return coords
+
+
+def _way_geometry(geom):
+    coords = _overpass_coords(geom)
+    if len(coords) < 2:
+        return None
+    closed = len(coords) >= 4 and coords[0] == coords[-1]
+    if not closed and len(coords) >= 3:
+        first, last = coords[0], coords[-1]
+        if abs(first[0] - last[0]) < 1e-7 and abs(first[1] - last[1]) < 1e-7:
+            coords = _close_ring(coords)
+            closed = True
+    if closed and len(coords) >= 4:
+        return {"type": "Polygon", "coordinates": [_close_ring(coords)]}
+    return {"type": "LineString", "coordinates": coords}
+
+
+def _relation_geometry(el):
+    outers = []
+    inners = []
+    for member in el.get("members") or []:
+        if member.get("type") != "way":
+            continue
+        coords = _overpass_coords(member.get("geometry"))
+        if len(coords) < 3:
+            continue
+        ring = _close_ring(coords)
+        if len(ring) < 4:
+            continue
+        role = (member.get("role") or "outer").lower()
+        if role == "inner":
+            inners.append(ring)
+        else:
+            outers.append(ring)
+    if not outers:
+        return None
+    if len(outers) == 1:
+        return {"type": "Polygon", "coordinates": [outers[0]] + inners}
+    return {"type": "MultiPolygon", "coordinates": [[ring] for ring in outers]}
+
+
+def _element_geometry(el):
+    etype = el.get("type")
+    if etype == "node":
+        try:
+            return {"type": "Point", "coordinates": [float(el["lon"]), float(el["lat"])]}
+        except (KeyError, TypeError, ValueError):
+            return None
+    if etype == "way":
+        return _way_geometry(el.get("geometry"))
+    if etype == "relation":
+        return _relation_geometry(el)
+    return None
+
+
+def _geom_centroid_latlon(geom):
+    if not isinstance(geom, dict):
+        return None
+    gtype = geom.get("type")
+    coords = geom.get("coordinates")
+    if gtype == "Point" and coords and len(coords) >= 2:
+        return float(coords[1]), float(coords[0])
+    if gtype == "LineString":
+        pts = coords or []
+    elif gtype == "Polygon":
+        pts = (coords or [[]])[0]
+    elif gtype == "MultiPolygon":
+        pts = ((coords or [[[]]])[0] or [[]])[0]
+    else:
+        return None
+    if not pts:
+        return None
+    lon = sum(float(p[0]) for p in pts) / len(pts)
+    lat = sum(float(p[1]) for p in pts) / len(pts)
+    return lat, lon
+
+
+def _place_kind(tags):
+    for key in ("leisure", "amenity", "tourism", "building", "natural", "landuse"):
+        val = tags.get(key)
+        if val:
+            return str(val)
+    return "place"
+
+
+def _overpass_query(lat, lon, radius_m):
+    around = "(around:%d,%.7f,%.7f)" % (int(radius_m), float(lat), float(lon))
+    return (
+        "[out:json][timeout:25];\n"
+        "(\n"
+        "  nwr%s[name][leisure~\"^(%s)$\"];\n"
+        "  nwr%s[name][landuse=recreation_ground];\n"
+        "  nwr%s[name][natural~\"^(%s)$\"];\n"
+        "  nwr%s[name][amenity~\"^(%s)$\"];\n"
+        "  nwr%s[name][tourism~\"^(%s)$\"];\n"
+        "  nwr%s[name][building~\"^(%s)$\"];\n"
+        ");\n"
+        "out geom;"
+    ) % (
+        around, _OVERPASS_LEISURE,
+        around,
+        around, _OVERPASS_NATURAL,
+        around, _OVERPASS_AMENITY,
+        around, _OVERPASS_TOURISM,
+        around, _OVERPASS_BUILDING,
+    )
+
+
+def _overpass_post(url, query, timeout=30.0):
+    return requests.post(
+        url,
+        data={"data": query},
+        headers={
+            "User-Agent": OVERPASS_USER_AGENT,
+            "Accept": "application/json",
+        },
+        timeout=timeout,
+    )
+
+
+def lookup_nearby_public_places(lat, lon, radius_m=NEARBY_PLACES_RADIUS_M):
+    """Return a GeoJSON FeatureCollection of named public OSM places near lat/lon."""
+    query = _overpass_query(lat, lon, radius_m)
+    last_error = None
+    data = None
+    for index, url in enumerate(OVERPASS_ENDPOINTS):
+        try:
+            resp = _overpass_post(url, query)
+            if resp.status_code in (429, 504) and index == 0:
+                last_error = requests.HTTPError(
+                    "%s %s" % (resp.status_code, url), response=resp
+                )
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except (requests.RequestException, ValueError, json.JSONDecodeError) as err:
+            last_error = err
+            if index == 0:
+                continue
+            break
+    if data is None:
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Overpass lookup failed")
+
+    features = []
+    seen = set()
+    for el in data.get("elements") or []:
+        tags = el.get("tags") or {}
+        name = (tags.get("name") or "").strip()
+        if not name:
+            continue
+        etype = el.get("type")
+        eid = el.get("id")
+        if etype not in ("node", "way", "relation") or eid is None:
+            continue
+        osm_id = "%s/%s" % (etype, eid)
+        if osm_id in seen:
+            continue
+        geom = _element_geometry(el)
+        if not geom:
+            continue
+        center = _geom_centroid_latlon(geom)
+        if center is None:
+            continue
+        seen.add(osm_id)
+        distance_m = round(_haversine_m(lat, lon, center[0], center[1]))
+        features.append({
+            "type": "Feature",
+            "geometry": geom,
+            "properties": {
+                "osm_id": osm_id,
+                "name": name,
+                "kind": _place_kind(tags),
+                "distance_m": distance_m,
+            },
+        })
+    features.sort(key=lambda f: f["properties"]["distance_m"])
+    return {
+        "type": "FeatureCollection",
+        "features": features[:NEARBY_PLACES_LIMIT],
+    }
+
+
+def _as_geojson_geometry(geom):
+    if not isinstance(geom, dict):
+        return None
+    gtype = geom.get("type")
+    coords = geom.get("coordinates")
+    if not gtype or coords is None:
+        return None
+    if gtype == "Point":
+        return Point(tuple(coords))
+    if gtype == "LineString":
+        return LineString(coords)
+    if gtype == "Polygon":
+        return Polygon(coords)
+    if gtype == "MultiPolygon":
+        return MultiPolygon(coords)
+    return geom
+
+
+def _world_feature_of_interest(service):
+    fois = service.features_of_interest().query().filter("substringof('World',name)").list()
+    if fois.entities:
+        return fois.entities[0]
+    foi = staplus_client.model.feature_of_interest.FeatureOfInterest(
+        name="The World",
+        description="somewhere on this planet",
+        encoding_type="application/geo+json",
+        feature=Feature(geometry=None),
+    )
+    service.create(foi)
+    return foi
+
+
+def _place_feature_of_interest(service, foi_spec):
+    props = foi_spec.get("properties") if isinstance(foi_spec, dict) else None
+    geom = foi_spec.get("geometry") if isinstance(foi_spec, dict) else None
+    if not props:
+        return None
+    osm_id = str(props.get("osm_id") or "").strip()
+    name = str(props.get("name") or "").strip()
+    geometry = _as_geojson_geometry(geom)
+    if not osm_id or not name or geometry is None:
+        return None
+    key = "osm:" + osm_id
+    try:
+        fois = service.features_of_interest().query().filter(
+            "substringof(" + _odata_quote(key) + ",description)"
+        ).list()
+        if fois.entities:
+            return fois.entities[0]
+    except Exception:
+        pass
+    foi = staplus_client.model.feature_of_interest.FeatureOfInterest(
+        name=name[:200],
+        description="Public OSM feature %s" % key,
+        encoding_type="application/geo+json",
+        feature=Feature(geometry=geometry),
+    )
+    service.create(foi)
+    return foi
+
 
 def pressure_normalization_factor(
     temperature: float = 15.0,
@@ -611,8 +907,220 @@ def authorize():
     _logger.info(user)
     return access_token, refresh_token, user, expires_at
 
-def refresh_mqtt_auth(client):
-    """Refresh OAuth tokens and update MQTT username/password for the next connect."""
+
+def _mqtt_reason_text(reason_code, properties=None):
+    """Human-readable MQTT 5 reason code plus optional Reason String."""
+    if reason_code is None:
+        return "unknown"
+    name = None
+    if hasattr(reason_code, "getName"):
+        try:
+            name = reason_code.getName()
+        except Exception:
+            name = None
+    value = getattr(reason_code, "value", None)
+    if value is None:
+        try:
+            value = int(reason_code)
+        except (TypeError, ValueError):
+            value = reason_code
+    bits = []
+    if name:
+        bits.append(str(name))
+    bits.append("code %s" % value)
+    extra = None
+    if properties is not None:
+        try:
+            extra = properties.json()
+        except Exception:
+            extra = None
+    if extra:
+        reason = extra.get("ReasonString") or extra.get("reasonString")
+        if reason:
+            bits.append(str(reason))
+        elif extra:
+            bits.append(str(extra))
+    return "; ".join(bits)
+
+
+def _mqtt_reason_failed(reason_code):
+    if reason_code is None:
+        return False
+    if hasattr(reason_code, "is_failure"):
+        try:
+            return bool(reason_code.is_failure)
+        except Exception:
+            pass
+    try:
+        return int(reason_code) not in (0, int(MQTTErrorCode.MQTT_ERR_SUCCESS))
+    except (TypeError, ValueError):
+        return True
+
+
+def _on_mqtt_connect(client, userdata, flags, reason_code, properties):
+    userdata["renewing_session"] = False
+    text = _mqtt_reason_text(reason_code, properties)
+    if _mqtt_reason_failed(reason_code):
+        _logger.error("MQTT connect failed: %s", text)
+        return
+    _logger.info("MQTT connected: %s", text)
+
+
+def _on_mqtt_disconnect(client, userdata, flags, reason_code, properties):
+    text = _mqtt_reason_text(reason_code, properties)
+    if userdata.get("shutting_down"):
+        _logger.info("MQTT disconnected (shutdown): %s", text)
+        return
+    if userdata.get("renewing_session"):
+        _logger.info("MQTT disconnected for token refresh: %s", text)
+        return
+    if _mqtt_reason_failed(reason_code):
+        _logger.error("MQTT disconnected: %s", text)
+    else:
+        _logger.warning("MQTT disconnected: %s", text)
+    try:
+        refresh_mqtt_auth(client)
+    except Exception as err:
+        _logger.error("Failed to refresh MQTT token before reconnect: %s", err)
+
+
+def _on_mqtt_publish(client, userdata, mid, reason_code, properties):
+    text = _mqtt_reason_text(reason_code, properties)
+    failed = _mqtt_reason_failed(reason_code)
+    userdata["last_puback"] = {"mid": mid, "reason": text, "failed": failed}
+    if failed:
+        _logger.error("MQTT PUBACK failed mid=%s %s", mid, text)
+    else:
+        _logger.debug("MQTT PUBACK mid=%s %s", mid, text)
+
+
+def _mqtt_publish_failed(rc):
+    return rc not in (
+        MQTTErrorCode.MQTT_ERR_SUCCESS,
+        MQTTErrorCode.MQTT_ERR_AGAIN,
+        0,
+    )
+
+
+def _await_mqtt_publish(client, msg_info, qos=MQTT_PUBLISH_QOS):
+    """Wait until the message has left the client; raise on local MQTT errors.
+
+    The STAplus broker does not send PUBACK for ObservationGroups, so QoS 0
+    (socket write) is the delivery signal. Broker auth failures show up as
+    connect/disconnect reason codes or a non-zero publish rc.
+    """
+    if _mqtt_publish_failed(msg_info.rc):
+        detail = error_string(msg_info.rc)
+        _logger.error(
+            "MQTT publish failed mid=%s rc=%s (%s) connected=%s",
+            msg_info.mid,
+            msg_info.rc,
+            detail,
+            client.is_connected(),
+        )
+        raise RuntimeError("MQTT publish failed: %s" % detail)
+
+    try:
+        msg_info.wait_for_publish(timeout=MQTT_PUBLISH_TIMEOUT)
+    except ValueError as err:
+        _logger.error(
+            "MQTT publish not queued mid=%s rc=%s (%s): %s",
+            msg_info.mid,
+            msg_info.rc,
+            error_string(msg_info.rc),
+            err,
+        )
+        raise RuntimeError("MQTT publish not queued: %s" % err) from err
+    except RuntimeError as err:
+        _logger.error(
+            "MQTT publish failed mid=%s rc=%s (%s): %s",
+            msg_info.mid,
+            msg_info.rc,
+            error_string(msg_info.rc),
+            err,
+        )
+        raise
+
+    delivered = False
+    try:
+        delivered = msg_info.is_published()
+    except RuntimeError as err:
+        _logger.error(
+            "MQTT publish status error mid=%s rc=%s (%s): %s",
+            msg_info.mid,
+            msg_info.rc,
+            error_string(msg_info.rc),
+            err,
+        )
+        raise
+
+    userdata = client.user_data_get() or {}
+    puback = userdata.get("last_puback") or {}
+    if qos >= 1 and puback.get("mid") == msg_info.mid and puback.get("failed"):
+        _logger.error("MQTT broker rejected publish mid=%s %s", msg_info.mid, puback.get("reason"))
+        raise RuntimeError("MQTT PUBACK failed: %s" % puback.get("reason"))
+
+    if delivered and not _mqtt_publish_failed(msg_info.rc):
+        _logger.debug(
+            "MQTT published mid=%s rc=%s (%s) qos=%s",
+            msg_info.mid,
+            msg_info.rc,
+            error_string(msg_info.rc),
+            qos,
+        )
+        return msg_info
+
+    detail = error_string(msg_info.rc) if msg_info.rc else "timed out waiting to send"
+    _logger.error(
+        "MQTT publish not sent mid=%s rc=%s (%s) qos=%s delivered=%s connected=%s",
+        msg_info.mid,
+        msg_info.rc,
+        detail,
+        qos,
+        delivered,
+        client.is_connected(),
+    )
+    raise RuntimeError("MQTT publish not sent: %s" % detail)
+
+def renew_mqtt_session(client, wait=5.0):
+    """CONNECT again so the broker session uses the current Bearer token.
+
+    username_pw_set only affects the next CONNECT; a live connection keeps the
+    old access token until this runs. Must not be called from MQTT callbacks.
+    """
+    userdata = client.user_data_get()
+    if userdata.get('shutting_down'):
+        return False
+    userdata['renewing_session'] = True
+    try:
+        client.loop_stop()
+        rc = client.reconnect()
+        client.loop_start()
+    except Exception:
+        userdata['renewing_session'] = False
+        try:
+            client.loop_start()
+        except Exception:
+            pass
+        raise
+    if rc not in (MQTTErrorCode.MQTT_ERR_SUCCESS, 0):
+        userdata['renewing_session'] = False
+        _logger.warning("MQTT reconnect after token refresh failed: %s", rc)
+        return False
+    if wait:
+        deadline = time.time() + wait
+        while not client.is_connected() and time.time() < deadline:
+            time.sleep(0.05)
+    if client.is_connected():
+        _logger.info("MQTT reconnected with refreshed access token")
+        return True
+    userdata['renewing_session'] = False
+    _logger.warning("MQTT did not come back after token refresh")
+    return False
+
+
+def refresh_mqtt_auth(client, reconnect=False):
+    """Refresh OAuth tokens and MQTT credentials. Reconnect if reconnect=True."""
     userdata = client.user_data_get()
     access_token, refresh_token, expires_at = updateTokens(userdata['refresh_token'])
     userdata['access_token'] = access_token
@@ -621,32 +1129,19 @@ def refresh_mqtt_auth(client):
     userdata['last_refresh'] = time.time()
     client.username_pw_set('Bearer', access_token)
     _logger.debug('MQTT credentials refreshed')
+    if reconnect:
+        renew_mqtt_session(client)
     return access_token, refresh_token
 
 def connect_mqtt(token, refresh_token, expires_at=None):
-    def on_connect(client, userdata, flags, reason_code, properties):
-        if reason_code == 0:
-            print("Connected to MQTT Broker!")
-        else:
-            print("Failed to connect, return code %s" % reason_code)
-
-    def on_disconnect(client, userdata, flags, reason_code, properties):
-        print("Disconnected with result code: %s" % reason_code)
-        if userdata.get('shutting_down'):
-            return
-        # Refresh credentials so paho's automatic reconnect uses a valid token.
-        # Do not sleep or call reconnect() here — that blocks the network loop.
-        try:
-            refresh_mqtt_auth(client)
-        except Exception as err:
-            print("Failed to refresh MQTT token before reconnect: %s" % err)
-
     userdata = {
         'access_token': token,
         'refresh_token': refresh_token,
         'expires_at': expires_at,
         'last_refresh': time.time(),
         'shutting_down': False,
+        'renewing_session': False,
+        'last_puback': None,
     }
     client = mqtt_client.Client(
         callback_api_version=mqtt_client.CallbackAPIVersion.VERSION2,
@@ -657,8 +1152,12 @@ def connect_mqtt(token, refresh_token, expires_at=None):
     )
     client.reconnect_delay_set(min_delay=FIRST_RECONNECT_DELAY, max_delay=MAX_RECONNECT_DELAY)
     client.username_pw_set('Bearer', token)
-    client.on_connect = on_connect
-    client.on_disconnect = on_disconnect
+    mqtt_log = logging.getLogger("paho.mqtt.client")
+    mqtt_log.setLevel(logging.INFO)
+    client.enable_logger(mqtt_log)
+    client.on_connect = _on_mqtt_connect
+    client.on_disconnect = _on_mqtt_disconnect
+    client.on_publish = _on_mqtt_publish
     client.connect(broker, port)
     #client.connect('localhost', port)
     client.loop_start()
@@ -713,23 +1212,13 @@ def parse_sck_line(data):
     }
 
 
-def prepare_publish(service, config):
+def prepare_publish(service, config, foi_spec=None):
     """Resolve FoI, Observation templates and license used for each MQTT publish."""
     foi = None
-    fois = service.features_of_interest().query().filter("substringof('World',name)").list()
-    if fois.entities:
-        for f in fois.entities:
-            foi = f
-            break
+    if foi_spec is not None:
+        foi = _place_feature_of_interest(service, foi_spec)
     if foi is None:
-        f = Feature(geometry=None)
-        foi = staplus_client.model.feature_of_interest.FeatureOfInterest(
-            name="The World",
-            description="somewhere on this planet",
-            encoding_type='application/geo+json',
-            feature=f,
-        )
-        service.create(foi)
+        foi = _world_feature_of_interest(service)
 
     print("foi: ", vars(foi))
 
@@ -872,17 +1361,11 @@ def publish_sample(client, party, ctx, values):
     group.observations = [temperature, humidity, light, pressure, noise, pm1, pm25, pm10]
     payload = json.dumps(transform_entity_to_json_dict(group))
     print(payload)
-    msg_info = client.publish("v1.1/ObservationGroups", payload)
-    try:
-        msg_info.wait_for_publish(timeout=5)
-    except RuntimeError as e:
-        print(f"Publish timeout error: {e}")
-
-    print("--- MQTTMessageInfo Details ---")
-    print(f"Message ID (mid)    : {msg_info.mid}")
-    print(f"Result Code (rc)    : {msg_info.rc}")
-    print(f"Is Fully Delivered? : {msg_info.is_published()}")
-    return msg_info
+    if not client.is_connected():
+        _logger.error("MQTT publish skipped: client is not connected")
+        raise RuntimeError("MQTT publish skipped: not connected")
+    msg_info = client.publish(MQTT_PUBLISH_TOPIC, payload, qos=MQTT_PUBLISH_QOS)
+    return _await_mqtt_publish(client, msg_info, qos=MQTT_PUBLISH_QOS)
 
 
 def publish(service, client, config, party, sck, loc=None):
@@ -901,9 +1384,9 @@ def publish(service, client, config, party, sck, loc=None):
         interval_due = time.time() - userdata.get('last_refresh', 0) >= TOKEN_REFRESH_INTERVAL
         if token_stale or interval_due:
             try:
-                refresh_mqtt_auth(client)
+                refresh_mqtt_auth(client, reconnect=True)
             except Exception as err:
-                print("Proactive MQTT token refresh failed: %s" % err)
+                _logger.error("Proactive MQTT token refresh failed: %s", err)
 
         data = None
         while sck.in_waiting:
@@ -1415,9 +1898,6 @@ def setup(service, user, location):
 
     return {'thing_id': str(raspi.id), 'temp_id': dsTemperatureId, 'humidity_id' : dsHumidityId, 'light_id': dsLightId, 'noise_id': dsNoiseId,
             'pressure_id': dsPressureId, 'pm1_id': dsPM1Id, 'pm25_id': dsPM25Id, 'pm10_id': dsPM10Id, 'elevation': elevation, 'license_id': cc_by_clone_id}
-
-def on_publish(client, userdata, mid, reason_code, properties):
-    print("mid: " + str(mid))
 
 if __name__ == "__main__":
     configure_ssl_certs()

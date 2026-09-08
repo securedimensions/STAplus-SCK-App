@@ -100,14 +100,25 @@
       color: #666;
       font: 12px system-ui, sans-serif;
     }
+    .sck-place-popup {
+      font: 13px/1.35 system-ui, sans-serif;
+    }
+    .sck-place-popup .kind {
+      color: #555;
+      text-transform: capitalize;
+    }
   </style>
 </head>
 <body>
   <div id="map"></div>
   <button id="locate" type="button">Use my location</button>
-  <div class="hint">Click the map or drag the marker to set the Thing location. Confirm in the app before publishing. After the kit is connected, click the marker for live charts.</div>
+  <div class="hint">Click the map or drag the marker to set the Thing location. Confirm in the app before publishing. Find nearby places, then click a park or public building to use it as the Feature of Interest. After the kit is connected, click the marker for live charts.</div>
   <script>
     let map, marker, bridge;
+    let placesLayer = null;
+    let selectedOsmId = null;
+    const PLACE_STYLE = { color: "#0b7285", weight: 2, fillColor: "#15aabf", fillOpacity: 0.28 };
+    const PLACE_SELECTED = { color: "#d9480f", weight: 3, fillColor: "#ff922b", fillOpacity: 0.45 };
     let chartData = [];
     let kitConnected = false;
     let openOnFirstReading = false;
@@ -425,6 +436,104 @@
       if (Number.isFinite(la) && Number.isFinite(lo)) {
         setMarker(la, lo, true);
       }
+    };
+
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function placeStyle(feature) {
+      if (feature && feature.properties && feature.properties.osm_id === selectedOsmId) {
+        return PLACE_SELECTED;
+      }
+      return PLACE_STYLE;
+    }
+
+    function circleMarkerOptions(feature) {
+      const selected = feature && feature.properties && feature.properties.osm_id === selectedOsmId;
+      const style = selected ? PLACE_SELECTED : PLACE_STYLE;
+      return {
+        radius: selected ? 9 : 8,
+        color: style.color,
+        weight: style.weight,
+        fillColor: style.fillColor,
+        fillOpacity: selected ? 0.9 : 0.85
+      };
+    }
+
+    function restylePlaces() {
+      if (!placesLayer) return;
+      placesLayer.eachLayer(function (layer) {
+        const feature = layer.feature;
+        if (layer.setStyle) layer.setStyle(placeStyle(feature));
+        if (typeof layer.setRadius === "function") {
+          const selected = feature && feature.properties && feature.properties.osm_id === selectedOsmId;
+          layer.setRadius(selected ? 9 : 8);
+        }
+      });
+    }
+
+    function onPlaceClick(feature, layer, e) {
+      if (e) L.DomEvent.stop(e);
+      selectedOsmId = feature && feature.properties ? feature.properties.osm_id : null;
+      restylePlaces();
+      if (layer && layer.openPopup) layer.openPopup();
+      if (bridge && bridge.selectPlace) {
+        bridge.selectPlace(JSON.stringify(feature));
+      }
+    }
+
+    window.sckPlaces = function (fc) {
+      if (!map) initMap();
+      if (!map) return;
+      window.sckClearPlaces();
+      if (!fc || !Array.isArray(fc.features) || !fc.features.length) return;
+      placesLayer = L.geoJSON(fc, {
+        bubblingMouseEvents: false,
+        style: placeStyle,
+        pointToLayer: function (feature, latlng) {
+          const opts = circleMarkerOptions(feature);
+          opts.bubblingMouseEvents = false;
+          return L.circleMarker(latlng, opts);
+        },
+        onEachFeature: function (feature, layer) {
+          if (layer.options) layer.options.bubblingMouseEvents = false;
+          const name = (feature.properties && feature.properties.name) || "Place";
+          const kind = (feature.properties && feature.properties.kind) || "";
+          const dist = feature.properties && feature.properties.distance_m;
+          let html = '<div class="sck-place-popup"><strong>' + escapeHtml(name) + "</strong>";
+          if (kind) html += '<div class="kind">' + escapeHtml(kind) + "</div>";
+          if (dist != null) html += "<div>" + escapeHtml(String(dist)) + " m from marker</div>";
+          html += "</div>";
+          layer.bindPopup(html);
+          layer.on("click", function (e) {
+            onPlaceClick(feature, layer, e);
+          });
+        }
+      }).addTo(map);
+      try {
+        const bounds = placesLayer.getBounds();
+        if (bounds && bounds.isValid()) {
+          map.fitBounds(bounds, { padding: [28, 28], maxZoom: 17 });
+        }
+      } catch (err) {}
+    };
+
+    window.sckClearPlaces = function () {
+      selectedOsmId = null;
+      if (placesLayer) {
+        placesLayer.remove();
+        placesLayer = null;
+      }
+    };
+
+    window.sckHighlightPlace = function (osmId) {
+      selectedOsmId = osmId || null;
+      restylePlaces();
     };
 
     function locateWithBrowser() {

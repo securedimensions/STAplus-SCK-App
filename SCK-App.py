@@ -8,6 +8,7 @@
 """PyQt6 desktop app for the Smart Citizen Kit STAplus publisher."""
 
 import json
+import logging
 import os
 import shutil
 import sys
@@ -62,7 +63,7 @@ from PyQt6.QtCore import (
 QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
 QCoreApplication.setApplicationName("STAplus-SCK")
 
-from PyQt6.QtGui import QCloseEvent, QDesktopServices, QIcon
+from PyQt6.QtGui import QCloseEvent, QDesktopServices, QFont, QIcon, QTextCursor
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWebEngineCore import (
     QWebEnginePage,
@@ -85,6 +86,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -253,6 +255,8 @@ class MapSchemeHandler(QWebEngineUrlSchemeHandler):
 APP_SUPPORT_DIR = _app_support_dir()
 _DATA_DIR = APP_SUPPORT_DIR if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 LOCATION_CACHE = os.path.join(_DATA_DIR, "sck_location.json")
+LOG_PATH = os.path.join(APP_SUPPORT_DIR, "sck.log")
+LOG_MAX_BYTES = 2 * 1024 * 1024
 AUTHENIX_PROFILE_DIR = os.path.join(APP_SUPPORT_DIR, "QtWebEngine", "sck-authenix")
 READING_ROWS = [
     ("phenomenon_time", "Time"),
@@ -267,6 +271,254 @@ READING_ROWS = [
 ]
 CHART_KEYS = [key for key, _label in READING_ROWS if key != "phenomenon_time"]
 CHART_WINDOW_S = 30 * 60
+_LOG_LOCK = threading.Lock()
+_LOG_INSTALLED = False
+
+
+def _rotate_log_file(path):
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) < LOG_MAX_BYTES:
+            return
+        backup = path + ".1"
+        if os.path.isfile(backup):
+            os.remove(backup)
+        os.replace(path, backup)
+    except OSError:
+        pass
+
+
+def _append_log_file(text):
+    if not text:
+        return
+    try:
+        os.makedirs(APP_SUPPORT_DIR, exist_ok=True)
+        with _LOG_LOCK:
+            _rotate_log_file(LOG_PATH)
+            with open(LOG_PATH, "a", encoding="utf-8") as handle:
+                handle.write(text)
+    except OSError:
+        pass
+
+
+class _AppLogIO:
+    """Mirror writes to the original stream and a rotating log file."""
+
+    def __init__(self, original):
+        self._original = original
+        self._buf = ""
+        self._lock = threading.Lock()
+        self._sck_log = True
+
+    @property
+    def encoding(self):
+        return getattr(self._original, "encoding", None) or "utf-8"
+
+    def write(self, data):
+        if data is None:
+            return 0
+        if not isinstance(data, str):
+            data = data.decode(self.encoding, "replace")
+        if self._original is not None:
+            try:
+                self._original.write(data)
+                self._original.flush()
+            except Exception:
+                pass
+        lines = []
+        with self._lock:
+            self._buf += data
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                lines.append(time.strftime("%Y-%m-%d %H:%M:%S ") + line + "\n")
+        for stamped in lines:
+            _append_log_file(stamped)
+        return len(data)
+
+    def flush(self):
+        leftover = ""
+        with self._lock:
+            leftover = self._buf
+            self._buf = ""
+        if leftover:
+            stamped = time.strftime("%Y-%m-%d %H:%M:%S ") + leftover
+            if not stamped.endswith("\n"):
+                stamped += "\n"
+            _append_log_file(stamped)
+        if self._original is not None:
+            try:
+                self._original.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        original = self._original
+        if original is not None and hasattr(original, "fileno"):
+            return original.fileno()
+        raise OSError("fileno")
+
+
+def install_app_log():
+    """Capture print() and logging output to LOG_PATH. Safe to call more than once."""
+    global _LOG_INSTALLED
+    if _LOG_INSTALLED:
+        return LOG_PATH
+    os.makedirs(APP_SUPPORT_DIR, exist_ok=True)
+    sys.stdout = _AppLogIO(getattr(sys, "stdout", None))
+    sys.stderr = _AppLogIO(getattr(sys, "stderr", None))
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+    logging.basicConfig(
+        stream=sys.stdout,
+        level=logging.DEBUG,
+        format="%(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+    _LOG_INSTALLED = True
+    print("Session start. Log file: %s" % LOG_PATH)
+    return LOG_PATH
+
+
+def reveal_log_file(path):
+    if not os.path.isfile(path):
+        return False
+    if sys.platform == "darwin":
+        result = QProcess.startDetached("open", ["-R", path])
+    elif sys.platform == "win32":
+        result = QProcess.startDetached("explorer", ["/select,", os.path.normpath(path)])
+    else:
+        folder = os.path.dirname(os.path.abspath(path))
+        return QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+    if isinstance(result, tuple):
+        return bool(result[0])
+    return bool(result)
+
+
+class LogDialog(QDialog):
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self._path = path
+        self._pos = 0
+        self.setWindowTitle("STAplus SCK log")
+        self.resize(720, 460)
+        self.path_label = QLabel(path)
+        self.path_label.setWordWrap(True)
+        self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        font = QFont("Menlo")
+        if not font.exactMatch():
+            font = QFont("Consolas")
+        if not font.exactMatch():
+            font = QFont("monospace")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setPointSize(11)
+        self.view.setFont(font)
+        open_btn = QPushButton("Open log file")
+        reveal_btn = QPushButton("Show in folder")
+        close_btn = QPushButton("Close")
+        open_btn.clicked.connect(self._open_file)
+        reveal_btn.clicked.connect(self._reveal_file)
+        close_btn.clicked.connect(self.close)
+        buttons = QHBoxLayout()
+        buttons.addWidget(open_btn)
+        buttons.addWidget(reveal_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(close_btn)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.path_label)
+        layout.addWidget(self.view, 1)
+        layout.addLayout(buttons)
+        self._timer = QTimer(self)
+        self._timer.setInterval(800)
+        self._timer.timeout.connect(self._poll)
+        self._load_existing()
+        self._timer.start()
+
+    def _load_existing(self):
+        self.view.clear()
+        self._pos = 0
+        try:
+            size = os.path.getsize(self._path)
+        except OSError:
+            self.view.setPlainText("")
+            return
+        start = 0
+        if size > 400000:
+            start = size - 400000
+        try:
+            with open(self._path, "r", encoding="utf-8", errors="replace") as handle:
+                if start:
+                    handle.seek(start)
+                    handle.readline()
+                text = handle.read()
+                self._pos = handle.tell()
+        except OSError as err:
+            self.view.setPlainText("Could not read the log:\n%s" % err)
+            return
+        if start:
+            text = "(Showing the end of the log.)\n" + text
+        self.view.setPlainText(text or "(Log is empty.)")
+        self._scroll_to_end()
+
+    def _poll(self):
+        try:
+            size = os.path.getsize(self._path)
+        except OSError:
+            return
+        if size < self._pos:
+            self._load_existing()
+            return
+        if size == self._pos:
+            return
+        try:
+            with open(self._path, "r", encoding="utf-8", errors="replace") as handle:
+                handle.seek(self._pos)
+                chunk = handle.read()
+                self._pos = handle.tell()
+        except OSError:
+            return
+        if not chunk:
+            return
+        bar = self.view.verticalScrollBar()
+        follow = bar.value() >= bar.maximum() - 8
+        self.view.moveCursor(QTextCursor.MoveOperation.End)
+        self.view.insertPlainText(chunk)
+        if follow:
+            self._scroll_to_end()
+
+    def _scroll_to_end(self):
+        bar = self.view.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _open_file(self):
+        if not os.path.isfile(self._path):
+            QMessageBox.information(self, "Log", "The log file has not been created yet.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self._path))
+
+    def _reveal_file(self):
+        if not os.path.isfile(self._path):
+            QMessageBox.information(self, "Log", "The log file has not been created yet.")
+            return
+        if not reveal_log_file(self._path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(self._path)))
+
+    def showEvent(self, event):
+        self._timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
 
 
 def load_location_cache():
@@ -433,6 +685,7 @@ def list_serial_ports():
 class MapBridge(QObject):
     markerMoved = pyqtSignal(float, float)
     locationRequested = pyqtSignal()
+    placeSelected = pyqtSignal(str)
 
     def __init__(self, lat, lon, parent=None):
         super().__init__(parent)
@@ -452,6 +705,10 @@ class MapBridge(QObject):
     @pyqtSlot()
     def requestLocation(self):
         self.locationRequested.emit()
+
+    @pyqtSlot(str)
+    def selectPlace(self, payload):
+        self.placeSelected.emit(payload)
 
 
 class AuthCodeWorker(QThread):
@@ -497,6 +754,23 @@ class AuthCodeWorker(QThread):
             return
         except Exception:
             self.failed.emit(traceback.format_exc())
+
+
+class PlacesWorker(QThread):
+    succeeded = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, lat, lon, parent=None):
+        super().__init__(parent)
+        self.lat = lat
+        self.lon = lon
+
+    def run(self):
+        try:
+            collection = sckapp.lookup_nearby_public_places(self.lat, self.lon)
+            self.succeeded.emit(collection)
+        except Exception as err:
+            self.failed.emit(str(err) or "Overpass lookup failed")
 
 
 class SetupWorker(QThread):
@@ -732,6 +1006,10 @@ class MainWindow(QMainWindow):
         self.serial_connected = False
         self.lat = None
         self.lon = None
+        self.selected_foi = None
+        self.places_worker = None
+        self._have_places = False
+        self._log_dialog = None
         self._chart_history = []
         self._browser_mode = "map"
         self._authorize_url = ""
@@ -763,6 +1041,12 @@ class MainWindow(QMainWindow):
         self.coord_label.setMinimumWidth(160)
         self.coord_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.confirm_location_btn = QPushButton("Use this marker")
+        self.find_places_btn = QPushButton("Find nearby places")
+        self.find_places_btn.setEnabled(False)
+        self.clear_foi_btn = QPushButton("Clear FoI")
+        self.clear_foi_btn.setEnabled(False)
+        self.foi_label = QLabel("The World (no geometry)")
+        self.foi_label.setWordWrap(True)
 
         self.start_btn = QPushButton("Start publishing")
         self.stop_btn = QPushButton("Stop")
@@ -793,6 +1077,13 @@ class MainWindow(QMainWindow):
         loc_layout.addRow("Name", self.name_edit)
         loc_layout.addRow("Marker", self.coord_label)
         loc_layout.addRow(self.confirm_location_btn)
+        loc_layout.addRow("Feature of interest", self.foi_label)
+        places_btns = QWidget()
+        places_row = QHBoxLayout(places_btns)
+        places_row.setContentsMargins(0, 0, 0, 0)
+        places_row.addWidget(self.find_places_btn)
+        places_row.addWidget(self.clear_foi_btn)
+        loc_layout.addRow(places_btns)
 
         auth_card = CollapsibleCard("Account")
         auth_layout = QVBoxLayout(auth_card.body)
@@ -824,6 +1115,8 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(auth_card)
         left_layout.addWidget(publish_card)
         left_layout.addWidget(readings_card, 1)
+        self.show_log_btn = QPushButton("Show log")
+        left_layout.addWidget(self.show_log_btn)
         self._left_layout = left_layout
         self._readings_card = readings_card
         readings_card.toggled.connect(self._on_readings_card_toggled)
@@ -871,6 +1164,7 @@ class MainWindow(QMainWindow):
         self._coord_flash_timer.timeout.connect(self._clear_coord_flash)
         self.bridge.markerMoved.connect(self.on_marker_moved)
         self.bridge.locationRequested.connect(self.request_os_location)
+        self.bridge.placeSelected.connect(self.on_place_selected)
         self.map_view.loadFinished.connect(self._on_map_loaded)
         self.map_view.load(QUrl(MAP_PAGE_HREF))
 
@@ -891,6 +1185,9 @@ class MainWindow(QMainWindow):
         self.refresh_ports_btn.clicked.connect(self.reload_ports)
         self.connect_serial_btn.clicked.connect(self.toggle_serial)
         self.confirm_location_btn.clicked.connect(self.confirm_location)
+        self.find_places_btn.clicked.connect(self.find_nearby_places)
+        self.clear_foi_btn.clicked.connect(self.clear_selected_foi)
+        self.show_log_btn.clicked.connect(self.show_log)
         self.start_btn.clicked.connect(self.start_publishing)
         self.stop_btn.clicked.connect(self.stop_publishing)
 
@@ -916,8 +1213,16 @@ class MainWindow(QMainWindow):
         self._coord_flash_timer.start(1200)
 
     def _set_coords(self, lat, lon, confirmed=False):
-        self.lat = float(lat)
-        self.lon = float(lon)
+        lat = float(lat)
+        lon = float(lon)
+        moved = (
+            self.lat is None
+            or self.lon is None
+            or abs(self.lat - lat) > 1e-6
+            or abs(self.lon - lon) > 1e-6
+        )
+        self.lat = lat
+        self.lon = lon
         self.bridge.lat = self.lat
         self.bridge.lon = self.lon
         self.marker_confirmed = bool(confirmed)
@@ -928,7 +1233,142 @@ class MainWindow(QMainWindow):
         else:
             self._coord_flash_timer.stop()
             self._clear_coord_flash()
+        if moved:
+            self._forget_nearby_places(announce=True)
         self._update_start_enabled()
+
+    def _forget_nearby_places(self, announce=False):
+        had = self.selected_foi is not None or self._have_places
+        self.selected_foi = None
+        self._have_places = False
+        self.foi_label.setText("The World (no geometry)")
+        self.clear_foi_btn.setEnabled(False)
+        self.map_view.page().runJavaScript(
+            "window.sckClearPlaces && window.sckClearPlaces();"
+        )
+        if announce and had:
+            self.statusBar().showMessage("Marker moved. Find nearby places again.")
+
+    def _update_places_buttons(self):
+        busy = self.places_worker is not None and self.places_worker.isRunning()
+        has_coords = self.lat is not None and self.lon is not None
+        self.find_places_btn.setEnabled(has_coords and not busy)
+        self.clear_foi_btn.setEnabled(self.selected_foi is not None)
+
+    def find_nearby_places(self):
+        if self.lat is None or self.lon is None:
+            QMessageBox.warning(
+                self,
+                "No location",
+                "Place a marker first, then find nearby places.",
+            )
+            return
+        if self.places_worker is not None and self.places_worker.isRunning():
+            return
+        self.find_places_btn.setEnabled(False)
+        self.statusBar().showMessage("Looking up nearby public places…")
+        self.places_worker = PlacesWorker(self.lat, self.lon, self)
+        self.places_worker.succeeded.connect(self.on_places_ready)
+        self.places_worker.failed.connect(self.on_places_failed)
+        self.places_worker.finished.connect(self._on_places_worker_finished)
+        self.places_worker.start()
+
+    def _on_places_worker_finished(self):
+        self._update_places_buttons()
+
+    def on_places_ready(self, collection):
+        origin_lat = getattr(self.places_worker, "lat", None)
+        origin_lon = getattr(self.places_worker, "lon", None)
+        if (
+            self.lat is None
+            or self.lon is None
+            or origin_lat is None
+            or origin_lon is None
+            or abs(self.lat - origin_lat) > 1e-6
+            or abs(self.lon - origin_lon) > 1e-6
+        ):
+            return
+        features = (collection or {}).get("features") or []
+        self._have_places = bool(features)
+        payload = json.dumps(collection or {"type": "FeatureCollection", "features": []})
+        self.map_view.page().runJavaScript(
+            "window.sckPlaces && window.sckPlaces(%s);" % payload
+        )
+        selected_id = None
+        if self.selected_foi:
+            selected_id = (self.selected_foi.get("properties") or {}).get("osm_id")
+            ids = {(item.get("properties") or {}).get("osm_id") for item in features}
+            if selected_id not in ids:
+                self.selected_foi = None
+                self.foi_label.setText("The World (no geometry)")
+                self.clear_foi_btn.setEnabled(False)
+                selected_id = None
+        if selected_id:
+            self.map_view.page().runJavaScript(
+                "window.sckHighlightPlace && window.sckHighlightPlace(%s);"
+                % json.dumps(selected_id)
+            )
+        radius = sckapp.NEARBY_PLACES_RADIUS_M
+        if not features:
+            self.statusBar().showMessage(
+                "No named public places within %d m." % radius
+            )
+            return
+        count = len(features)
+        self.statusBar().showMessage(
+            "Found %d public place%s. Click one to use as Feature of Interest."
+            % (count, "" if count == 1 else "s")
+        )
+
+    def on_places_failed(self, error):
+        origin_lat = getattr(self.places_worker, "lat", None)
+        origin_lon = getattr(self.places_worker, "lon", None)
+        if (
+            origin_lat is not None
+            and origin_lon is not None
+            and self.lat is not None
+            and self.lon is not None
+            and (
+                abs(self.lat - origin_lat) > 1e-6
+                or abs(self.lon - origin_lon) > 1e-6
+            )
+        ):
+            return
+        self._have_places = False
+        self.statusBar().showMessage("Could not look up nearby places.")
+        QMessageBox.warning(
+            self,
+            "Nearby places",
+            "Could not look up nearby public places.\n\n%s" % error,
+        )
+
+    def on_place_selected(self, payload):
+        try:
+            feature = json.loads(payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(feature, dict):
+            return
+        props = feature.get("properties") or {}
+        name = str(props.get("name") or "").strip()
+        if not name or not feature.get("geometry"):
+            return
+        self.selected_foi = feature
+        kind = str(props.get("kind") or "").strip()
+        self.foi_label.setText("%s (%s)" % (name, kind) if kind else name)
+        self.clear_foi_btn.setEnabled(True)
+        self.statusBar().showMessage("Feature of Interest: %s" % name)
+
+    def clear_selected_foi(self):
+        self.selected_foi = None
+        self.foi_label.setText("The World (no geometry)")
+        self.clear_foi_btn.setEnabled(False)
+        self.map_view.page().runJavaScript(
+            "window.sckHighlightPlace && window.sckHighlightPlace(null);"
+        )
+        self.statusBar().showMessage(
+            "Using The World (no geometry) as Feature of Interest."
+        )
 
     def _grant_geolocation(self):
         page = self.map_page
@@ -1525,8 +1965,8 @@ class MainWindow(QMainWindow):
                     if token_stale or interval_due:
                         self.refresh_session_tokens()
                     sckapp.publish_sample(self.mqtt_client, self.party, self.publish_ctx, values)
-            except Exception:
-                self.statusBar().showMessage("Publish failed; see console.")
+            except Exception as err:
+                self.statusBar().showMessage("Publish failed: %s" % err)
                 traceback.print_exc()
             return
         self._show_readings({
@@ -1567,6 +2007,7 @@ class MainWindow(QMainWindow):
         self.publish_hint.setText("Login required")
         self.publish_hint.setVisible(need_login)
         self.start_btn.setToolTip("Login required" if need_login else "")
+        self._update_places_buttons()
 
     def start_publishing(self):
         if not self.user or not self.access_token:
@@ -1616,7 +2057,7 @@ class MainWindow(QMainWindow):
         self.config = config
         self.party = party
         try:
-            self.publish_ctx = sckapp.prepare_publish(service, config)
+            self.publish_ctx = sckapp.prepare_publish(service, config, self.selected_foi)
             self.mqtt_client = sckapp.connect_mqtt(
                 self.access_token, self.refresh_token, self.access_token_expires_at
             )
@@ -1642,17 +2083,18 @@ class MainWindow(QMainWindow):
         if not self.refresh_token:
             return False
         try:
-            access_token, refresh_token, expires_at = sckapp.updateTokens(self.refresh_token)
-            self.access_token = access_token
-            self.refresh_token = refresh_token
-            self.access_token_expires_at = expires_at
             if self.mqtt_client is not None:
+                access_token, refresh_token = sckapp.refresh_mqtt_auth(
+                    self.mqtt_client, reconnect=True
+                )
                 userdata = self.mqtt_client.user_data_get()
-                userdata["access_token"] = access_token
-                userdata["refresh_token"] = refresh_token
-                userdata["expires_at"] = expires_at
-                userdata["last_refresh"] = time.time()
-                self.mqtt_client.username_pw_set("Bearer", access_token)
+                self.access_token = access_token
+                self.refresh_token = refresh_token
+                self.access_token_expires_at = userdata.get("expires_at")
+            else:
+                self.access_token, self.refresh_token, self.access_token_expires_at = (
+                    sckapp.updateTokens(self.refresh_token)
+                )
             return True
         except Exception as err:
             self.statusBar().showMessage(f"Token refresh failed: {err}")
@@ -1676,6 +2118,13 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Publishing stopped. The kit can stay connected.")
         self._update_start_enabled()
 
+    def show_log(self):
+        if self._log_dialog is None:
+            self._log_dialog = LogDialog(LOG_PATH, self)
+        self._log_dialog.show()
+        self._log_dialog.raise_()
+        self._log_dialog.activateWindow()
+
     def closeEvent(self, event: QCloseEvent):
         self._stop_locate_proc()
         if self.auth_worker is not None and self.auth_worker.isRunning():
@@ -1695,11 +2144,17 @@ class MainWindow(QMainWindow):
             self.login_view.setPage(spare)
             if old_page is not None:
                 old_page.deleteLater()
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
         event.accept()
 
 
 def main():
     _prepare_frozen_workdir()
+    install_app_log()
     sckapp.configure_ssl_certs()
     _register_map_scheme()
     app = QApplication(sys.argv)
